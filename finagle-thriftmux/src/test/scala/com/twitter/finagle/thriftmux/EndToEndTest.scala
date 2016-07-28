@@ -6,26 +6,25 @@ import com.twitter.finagle.builder.{ClientBuilder, ServerBuilder}
 import com.twitter.finagle.client.StackClient
 import com.twitter.finagle.context.Contexts
 import com.twitter.finagle.dispatch.PipeliningDispatcher
-import com.twitter.finagle.param.{Tracer => PTracer, Label, Stats}
+import com.twitter.finagle.param.{Label, Stats, Tracer => PTracer}
 import com.twitter.finagle.service.{ReqRep, ResponseClass, ResponseClassifier, Retries, RetryBudget}
-import com.twitter.finagle.stats.{NullStatsReceiver, InMemoryStatsReceiver}
-import com.twitter.finagle.thrift.service.ThriftResponseClassifier
+import com.twitter.finagle.stats.{InMemoryStatsReceiver, NullStatsReceiver}
 import com.twitter.finagle.thrift.{ClientId, Protocols, ThriftClientFramedCodec, ThriftClientRequest}
 import com.twitter.finagle.thriftmux.service.ThriftMuxResponseClassifier
-import com.twitter.finagle.thriftmux.thriftjava
 import com.twitter.finagle.thriftmux.thriftscala._
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.tracing.Annotation.{ClientSend, ServerRecv}
 import com.twitter.finagle.transport.Transport
+import com.twitter.finagle.util.HashedWheelTimer
 import com.twitter.io.Buf
-import com.twitter.util.{Await, Awaitable, Closable, Duration, Future, Promise, Return, Time, Throw}
+import com.twitter.util._
 import java.net.{InetAddress, InetSocketAddress, SocketAddress}
 import org.apache.thrift.protocol._
 import org.apache.thrift.TApplicationException
 import org.junit.runner.RunWith
-import org.scalatest.{FunSuite, Tag}
-import org.scalatest.concurrent.{IntegrationPatience, Eventually}
+import org.scalatest.concurrent.{Eventually, IntegrationPatience}
 import org.scalatest.junit.{AssertionsForJUnit, JUnitRunner}
+import org.scalatest.{FunSuite, Tag}
 import scala.language.reflectiveCalls
 
 @RunWith(classOf[JUnitRunner])
@@ -185,6 +184,11 @@ class EndToEndTest extends FunSuite
       val protoOld = ThriftMuxServer
         .withProtocolFactory(pf)
         .serveIface(new InetSocketAddress(InetAddress.getLoopbackAddress, 0), iface)
+      val netty4 = ThriftMux.server
+        .configured(Mux.param.MuxImpl.Netty4)
+        .withProtocolFactory(pf)
+        .serveIface(new InetSocketAddress(InetAddress.getLoopbackAddress, 0), iface)
+
 
       def port(socketAddr: SocketAddress): Int =
         socketAddr.asInstanceOf[InetSocketAddress].getPort
@@ -193,7 +197,8 @@ class EndToEndTest extends FunSuite
         ("ServerBuilder deprecated", builderOld, port(builderOld.boundAddress)),
         ("ServerBuilder", builder, port(builder.boundAddress)),
         ("ThriftMux proto deprecated", protoOld, port(protoOld.boundAddress)),
-        ("ThriftMux proto", protoOld, port(protoNew.boundAddress))
+        ("ThriftMux proto", protoOld, port(protoNew.boundAddress)),
+        ("ThriftMux with Netty4", netty4, port(netty4.boundAddress))
       )
     }
 
@@ -227,6 +232,11 @@ class EndToEndTest extends FunSuite
         .withClientId(clientId)
         .withProtocolFactory(pf)
         .newService(dest)
+      val netty4 = ThriftMux.client
+        .withClientId(clientId)
+        .withProtocolFactory(pf)
+        .configured(Mux.param.MuxImpl.Netty4)
+        .newService(dest)
 
       def toIface(svc: Service[ThriftClientRequest, Array[Byte]]): TestService$FinagleClient =
         new TestService.FinagledClient(svc, pf)
@@ -237,7 +247,8 @@ class EndToEndTest extends FunSuite
         ("Thrift via ClientBuilder", toIface(thriftBuilder), thriftBuilder),
         ("Thrift via proto", toIface(thriftProto), thriftProto),
         ("ThriftMux proto deprecated", toIface(oldProto), oldProto),
-        ("ThriftMux proto", toIface(newProto), newProto)
+        ("ThriftMux proto", toIface(newProto), newProto),
+        ("ThriftMux with Netty4", toIface(netty4), netty4)
       )
     }
 
@@ -324,7 +335,7 @@ class EndToEndTest extends FunSuite
     val server = ThriftMux.server.serveIface(
       new InetSocketAddress(InetAddress.getLoopbackAddress, 0),
       new TestService.FutureIface {
-        def query(x: String) = Future.value(ClientId.current map { _.name } getOrElse(""))
+        def query(x: String) = Future.value(ClientId.current.map(_.name).getOrElse(""))
       })
 
     val clientId = "test.service"
@@ -343,7 +354,7 @@ class EndToEndTest extends FunSuite
     val server = ThriftMux.server.serveIface(
       new InetSocketAddress(InetAddress.getLoopbackAddress, 0),
       new TestService.FutureIface {
-        def query(x: String) = Future.value(ClientId.current map { _.name } getOrElse(""))
+        def query(x: String) = Future.value(ClientId.current.map(_.name).getOrElse(""))
       })
 
     val clientId = ClientId("test.service")
@@ -388,7 +399,7 @@ class EndToEndTest extends FunSuite
     val server = ThriftMux.server.serveIface(
       new InetSocketAddress(InetAddress.getLoopbackAddress, 0),
       new TestService.FutureIface {
-        def query(x: String) = Future.value(ClientId.current map { _.name } getOrElse(""))
+        def query(x: String) = Future.value(ClientId.current.map(_.name).getOrElse(""))
       })
 
     val clientId = ClientId("test.service")
@@ -509,6 +520,8 @@ class EndToEndTest extends FunSuite
         ResponseClass.Success
       case ReqRep(_, Throw(_: InvalidQueryException)) =>
         ResponseClass.NonRetryableFailure
+      case ReqRep(_, Throw(_: RequestTimeoutException)) =>
+        ResponseClass.Success
       case ReqRep(_, Return(s: String)) =>
         ResponseClass.NonRetryableFailure
   }
@@ -525,8 +538,12 @@ class EndToEndTest extends FunSuite
   def serverForClassifier(): ListeningServer  = {
     val iface = new TestService.FutureIface {
       def query(x: String) =
-        if (x == "safe") Future.value("safe")
-        else Future.exception(new InvalidQueryException(x.length))
+        if (x == "safe")
+          Future.value("safe")
+        else if (x == "slow")
+          Future.sleep(1.second)(HashedWheelTimer.Default).before(Future.value("slow"))
+        else
+          Future.exception(new InvalidQueryException(x.length))
     }
     val svc = new TestService.FinagledService(iface, Protocols.binaryFactory())
     ThriftMux.server
@@ -571,6 +588,19 @@ class EndToEndTest extends FunSuite
       assert(sr.counters(Seq("client", "query", "success")) == 1)
       assert(sr.counters(Seq("client", "query", "failures")) == 2)
     }
+
+    // this query produces a `Throw` response produced on the client side and
+    // we want to ensure that we can translate it to a `Success`.
+    intercept[RequestTimeoutException] {
+      await(client.query("slow"))
+    }
+    assert(sr.counters(Seq("client", "requests")) == 4)
+    assert(sr.counters(Seq("client", "success")) == 2)
+    assert(sr.counters(Seq("client", "query", "requests")) == 4)
+    eventually {
+      assert(sr.counters(Seq("client", "query", "success")) == 2)
+      assert(sr.counters(Seq("client", "query", "failures")) == 2)
+    }
   }
 
   private def testJavaFailureClassification(
@@ -602,8 +632,9 @@ class EndToEndTest extends FunSuite
     val server = serverForClassifier()
     val sr = new InMemoryStatsReceiver()
     val client = ThriftMux.client
-      .configured(Stats(sr))
+      .withStatsReceiver(sr)
       .withResponseClassifier(scalaClassifier)
+      .withRequestTimeout(100.milliseconds) // used in conjuection with a "slow" query
       .newIface[TestService.FutureIface](Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])), "client")
 
     testScalaFailureClassification(sr, client)
@@ -614,7 +645,7 @@ class EndToEndTest extends FunSuite
     val server = serverForClassifier()
     val sr = new InMemoryStatsReceiver()
     val client = ThriftMux.client
-      .configured(Stats(sr))
+      .withStatsReceiver(sr)
       .withResponseClassifier(javaClassifier)
       .newIface[thriftjava.TestService.ServiceIface](Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])), "client")
 
@@ -630,6 +661,7 @@ class EndToEndTest extends FunSuite
       .name("client")
       .reportTo(sr)
       .responseClassifier(scalaClassifier)
+      .requestTimeout(100.milliseconds) // used in conjuection with a "slow" query
       .dest(Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])))
       .build()
     val client = new TestService.FinagledClient(
@@ -724,7 +756,7 @@ class EndToEndTest extends FunSuite
 
     object OldPlainPipeliningThriftClient extends Thrift.Client(stack=StackClient.newStack) {
       override protected def newDispatcher(transport: Transport[ThriftClientRequest, Array[Byte]]) =
-        new PipeliningDispatcher(transport)
+        new PipeliningDispatcher(transport, NullStatsReceiver, new MockTimer)
     }
 
     val service = await(OldPlainPipeliningThriftClient.newClient(server)())
@@ -929,7 +961,7 @@ class EndToEndTest extends FunSuite
   }
 
   test("drain downgraded connections") {
-    val response = Promise[String]
+    val response = new Promise[String]()
     val iface = new TestService.FutureIface {
       def query(x: String): Future[String] = response
     }
@@ -1042,7 +1074,7 @@ class EndToEndTest extends FunSuite
 
       assert(sr.counters(Seq("client", "requests")) == 1)
       assert(sr.counters(Seq("client", "failures")) == 1)
-      assert(sr.counters(Seq("client", "closed")) == 1)
+      assert(sr.stats(Seq("client", "connection_duration")).size == 1)
       assert(sr.counters.get(Seq("client", "retries", "requeues")) == None)
 
       intercept[ChannelClosedException](await(client.query("ok")))

@@ -4,7 +4,8 @@ junit_tests(name='scala',
     '3rdparty/jvm/org/mockito:mockito-all',
     '3rdparty/jvm/org/scalacheck',
     '3rdparty/jvm/org/scalatest',
-    'finagle/finagle-netty4-http'
+    'finagle/finagle-netty4-http',
+    'finagle/finagle-http:tests',
   ],
   fatal_warnings=True,
   sources=rglobs('*.scala')

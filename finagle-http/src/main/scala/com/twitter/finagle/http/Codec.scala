@@ -6,7 +6,8 @@ import com.twitter.finagle.dispatch.GenSerialClientDispatcher
 import com.twitter.finagle.filter.PayloadSizeFilter
 import com.twitter.finagle.http.codec._
 import com.twitter.finagle.http.filter.{ClientContextFilter, DtabFilter, HttpNackFilter, ServerContextFilter}
-import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
+import com.twitter.finagle.http.netty.{Netty3ClientStreamTransport, Netty3ServerStreamTransport}
+import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver, ServerStatsReceiver}
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.Transport
 import com.twitter.util.{NonFatal, Closable, StorageUnit, Try}
@@ -199,6 +200,7 @@ case class Http(
   def maxRequestSize(bufferSize: StorageUnit) = copy(_maxRequestSize = bufferSize)
   def maxResponseSize(bufferSize: StorageUnit) = copy(_maxResponseSize = bufferSize)
   def decompressionEnabled(yesno: Boolean) = copy(_decompressionEnabled = yesno)
+  @deprecated("Use maxRequestSize to enforce buffer footprint limits", "2016-05-10")
   def channelBufferUsageTracker(usageTracker: ChannelBufferUsageTracker) =
     copy(_channelBufferUsageTracker = Some(usageTracker))
   def annotateCipherHeader(headerName: String) = copy(_annotateCipherHeader = Option(headerName))
@@ -245,27 +247,31 @@ case class Http(
         // Waiting on CSL-915 for a proper fix.
         underlying.map { u =>
           val filters =
-            new ClientContextFilter[Request, Response].andThenIf(!_streaming ->
-              new PayloadSizeFilter[Request, Response](
-                params[param.Stats].statsReceiver, _.content.length, _.content.length
+            new ClientContextFilter[Request, Response]
+              .andThen(new DtabFilter.Injector)
+              .andThenIf(!_streaming ->
+                new PayloadSizeFilter[Request, Response](
+                  params[param.Stats].statsReceiver, _.content.length, _.content.length
+                )
               )
-            )
 
           filters.andThen(new DelayedReleaseService(u))
         }
 
       override def newClientTransport(ch: Channel, statsReceiver: StatsReceiver): Transport[Any,Any] =
-        new HttpTransport(super.newClientTransport(ch, statsReceiver))
+        super.newClientTransport(ch, statsReceiver)
 
       override def newClientDispatcher(transport: Transport[Any, Any], params: Stack.Params) =
         new HttpClientDispatcher(
-          transport,
+          new HttpTransport(new Netty3ClientStreamTransport(transport)),
           params[param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
         )
 
       override def newTraceInitializer =
         if (_enableTracing) new HttpClientTraceInitializer[Request, Response]
         else TraceInitializerFilter.empty[Request, Response]
+
+      override def protocolLibraryName: String = Http.this.protocolLibraryName
     }
   }
 
@@ -315,8 +321,10 @@ case class Http(
       override def newServerDispatcher(
         transport: Transport[Any, Any],
         service: Service[Request, Response]
-      ): Closable =
-        new HttpServerDispatcher(new HttpTransport(transport), service)
+      ): Closable = new HttpServerDispatcher(
+        new HttpTransport(new Netty3ServerStreamTransport(transport)),
+        service,
+        ServerStatsReceiver)
 
       override def prepareConnFactory(
         underlying: ServiceFactory[Request, Response],
@@ -324,7 +332,7 @@ case class Http(
       ): ServiceFactory[Request, Response] = {
         val param.Stats(stats) = params[param.Stats]
         new HttpNackFilter(stats)
-          .andThen(new DtabFilter.Finagle[Request])
+          .andThen(new DtabFilter.Extractor)
           .andThen(new ServerContextFilter[Request, Response])
           .andThenIf(!_streaming -> new PayloadSizeFilter[Request, Response](
             stats, _.content.length, _.content.length)

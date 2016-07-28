@@ -42,8 +42,10 @@ object ServerBuilder {
     Req, Rep, ServerConfig.Yes,
     ServerConfig.Yes, ServerConfig.Yes]
 
-  def apply() = new ServerBuilder()
-  def get() = apply()
+  def apply(): ServerBuilder[Nothing, Nothing, Nothing, Nothing, Nothing] =
+    new ServerBuilder()
+  def get(): ServerBuilder[Nothing, Nothing, Nothing, Nothing, Nothing] =
+    apply()
 
   /**
    * Provides a typesafe `build` for Java.
@@ -65,7 +67,7 @@ object ServerConfig {
   sealed trait Yes
   type FullySpecified[Req, Rep] = ServerConfig[Req, Rep, Yes, Yes, Yes]
 
-  def nilServer[Req, Rep] = new FinagleServer[Req, Rep] {
+  def nilServer[Req, Rep]: FinagleServer[Req, Rep] = new FinagleServer[Req, Rep] {
     def serve(addr: SocketAddress, service: ServiceFactory[Req, Rep]): ListeningServer =
       NullServer
   }
@@ -185,7 +187,7 @@ class ServerBuilder[Req, Rep, HasCodec, HasBindTo, HasName] private[builder](
 
   private[builder] def this() = this(Stack.Params.empty, Function.const(ServerConfig.nilServer)_)
 
-  override def toString() = "ServerBuilder(%s)".format(params)
+  override def toString: String = "ServerBuilder(%s)".format(params)
 
   protected def copy[Req1, Rep1, HasCodec1, HasBindTo1, HasName1](
     ps: Stack.Params,
@@ -267,24 +269,8 @@ class ServerBuilder[Req, Rep, HasCodec, HasBindTo, HasName] private[builder](
         protected def newListener(): Listener[Any, Any] =
           Netty3Listener(codec.pipelineFactory, params)
 
-        protected def newDispatcher(transport: Transport[In, Out], service: Service[Req1, Rep1]) = {
-          // TODO: Expiration logic should be installed using ExpiringService
-          // in StackServer#newStack. Then we can thread through "closes"
-          // via ClientConnection.
-          val Timer(timer) = params[Timer]
-          val ExpiringService.Param(idleTime, lifeTime) = params[ExpiringService.Param]
-          val Stats(sr) = params[Stats]
-          val idle = if (idleTime.isFinite) Some(idleTime) else None
-          val life = if (lifeTime.isFinite) Some(lifeTime) else None
-          val dispatcher = codec.newServerDispatcher(transport, service)
-          (idle, life) match {
-            case (None, None) => dispatcher
-            case _ =>
-              new ExpiringService(service, idle, life, timer, sr.scope("expired")) {
-                protected def onExpire() { dispatcher.close(Time.now) }
-              }
-          }
-        }
+        protected def newDispatcher(transport: Transport[In, Out], service: Service[Req1, Rep1]) =
+          codec.newServerDispatcher(transport, service)
       }
 
       val proto = ps[ProtocolLibrary]
@@ -498,6 +484,9 @@ class ServerBuilder[Req, Rep, HasCodec, HasBindTo, HasName] private[builder](
    *
    * Http.server.withRequestTimeout(howlong)
    * }}}
+   *
+   * @note if the request is not complete after `howlong`, the work that is
+   *       in progress will be interrupted via [[Future.raise]].
    */
   def requestTimeout(howlong: Duration): This =
     configured(TimeoutFilter.Param(howlong))
@@ -591,6 +580,10 @@ class ServerBuilder[Req, Rep, HasCodec, HasBindTo, HasName] private[builder](
   def hostConnectionMaxLifeTime(howlong: Duration): This =
     configured(params[ExpiringService.Param].copy(lifeTime = howlong))
 
+  /**
+   * @note not all protocol implementations support this, such as
+   *       `com.twitter.finagle.ThriftMux`.
+   */
   def openConnectionsThresholds(thresholds: OpenConnectionsThresholds): This =
     configured(IdleConnectionFilter.Param(Some(thresholds)))
 

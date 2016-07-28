@@ -7,18 +7,20 @@ import com.twitter.util.Future
 
 /**
  * Forwards dark traffic to the given service when the given function returns true for a request.
+ *
  * @param darkService Service to take dark traffic
  * @param enableSampling if function returns true, the request will forward
  * @param statsReceiver keeps stats for requests forwarded, skipped and failed.
- * @Param forwardAfterService forward the dark request after the service has processed the request
+ * @param forwardAfterService forward the dark request after the service has processed the request
  *        instead of concurrently.
  */
 class DarkTrafficFilter[Req, Rep](
     darkService: Service[Req, Rep],
     enableSampling: Req => Boolean,
-    statsReceiver: StatsReceiver,
+    override val statsReceiver: StatsReceiver,
     forwardAfterService: Boolean)
-  extends SimpleFilter[Req, Rep] {
+  extends SimpleFilter[Req, Rep]
+  with AbstractDarkTrafficFilter {
 
   def this(
     darkService: Service[Req, Rep],
@@ -26,35 +28,19 @@ class DarkTrafficFilter[Req, Rep](
     statsReceiver: StatsReceiver
   ) = this(darkService, enableSampling, statsReceiver, false)
 
-  private[this] val scopedStatsReceiver      = statsReceiver.scope("darkTrafficFilter")
-  private[this] val requestsForwardedCounter = scopedStatsReceiver.counter("forwarded")
-  private[this] val requestsSkippedCounter   = scopedStatsReceiver.counter("skipped")
-  private[this] val failedCounter            = scopedStatsReceiver.counter("failed")
   private[this] val log = Logger.get("DarkTrafficFilter")
 
   override def apply(request: Req, service: Service[Req, Rep]): Future[Rep] = {
     if (forwardAfterService) {
       service(request).ensure {
-        darkRequest(request)
+        sendDarkRequest(request)(enableSampling, darkService)
       }
     } else {
-      val rep = service(request)
-      darkRequest(request)
-      rep
+      serviceConcurrently(service, request)(enableSampling, darkService)
     }
   }
 
-  private[this] def darkRequest(request: Req): Unit = {
-    if (enableSampling(request)) {
-      requestsForwardedCounter.incr()
-      darkService(request).onFailure { t: Throwable =>
-        // This may not count if you're using a one-way service
-        failedCounter.incr()
-
-        log.error(t, t.getMessage)
-      }
-    } else {
-      requestsSkippedCounter.incr()
-    }
+  override protected def handleFailedInvocation(t: Throwable): Unit = {
+    log.error(t, t.getMessage)
   }
 }

@@ -2,22 +2,26 @@ package com.twitter.finagle.memcached
 
 import _root_.java.lang.{Boolean => JBoolean, Long => JLong}
 import _root_.java.net.{InetSocketAddress, SocketAddress}
+import com.twitter.bijection.Bijection
 import com.twitter.concurrent.Broker
 import com.twitter.conversions.time._
 import com.twitter.finagle
 import com.twitter.finagle._
 import com.twitter.finagle.builder.{ClientBuilder, ClientConfig, Cluster}
-import com.twitter.finagle.cacheresolver.{CacheNode, CacheNodeGroup}
+import com.twitter.finagle.client.Transporter
 import com.twitter.finagle.memcached.exp.LocalMemcached
 import com.twitter.finagle.memcached.protocol.{text, _}
 import com.twitter.finagle.memcached.util.Bufs.{RichBuf, nonEmptyStringToBuf, seqOfNonEmptyStringToBuf}
-import com.twitter.finagle.service.{ReqRep, Backoff, FailedService, FailureAccrualFactory}
 import com.twitter.finagle.service.exp.FailureAccrualPolicy
-import com.twitter.finagle.stats.{ClientStatsReceiver, NullStatsReceiver, StatsReceiver}
+import com.twitter.finagle.service.{FailedService, ReqRep, ResponseClassifier, FailureAccrualFactory}
+import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
 import com.twitter.hashing._
 import com.twitter.io.{Buf, Charsets}
+import com.twitter.logging.Level
 import com.twitter.util.{Command => _, Function => _, _}
+import scala.collection.breakOut
 import scala.collection.{immutable, mutable}
+
 
 object Client {
   /**
@@ -382,7 +386,7 @@ trait Client extends BaseClient[Buf] {
   def withStrings: BaseClient[String] = adapt(
     new Bijection[Buf, String] {
       def apply(a: Buf): String  = a match { case Buf.Utf8(s) => s }
-      def invert(b: String): Buf = Buf.Utf8(b)
+      override def invert(b: String): Buf = Buf.Utf8(b)
     }
   )
 
@@ -390,7 +394,7 @@ trait Client extends BaseClient[Buf] {
   def withBytes: BaseClient[Array[Byte]] = adapt(
     new Bijection[Buf, Array[Byte]] {
       def apply(a: Buf): Array[Byte]  = a.toArray
-      def invert(b: Array[Byte]): Buf = Buf.ByteArray.Owned(b)
+      override def invert(b: Array[Byte]): Buf = Buf.ByteArray.Owned(b)
     }
   )
 }
@@ -495,7 +499,7 @@ protected class ConnectedClient(protected val service: Service[Command, Response
       service(Set(key, flags, expiry, value)).map {
         case Stored() => ()
         case Error(e) => throw e
-        case _        => throw new IllegalStateException
+        case response => throw new IllegalStateException(s"Invalid response: $response")
       }
     } catch {
       case t: IllegalArgumentException => Future.exception(new ClientError(t.getMessage + " For key: " + key))
@@ -739,38 +743,57 @@ private[finagle] object KetamaFailureAccrualFactory {
     key: KetamaClientKey,
     healthBroker: Broker[NodeHealth]
   ): Stackable[ServiceFactory[Req, Rep]] =
-    new Stack.Module5[
-      FailureAccrualFactory.Param,
-      Memcached.param.EjectFailedHost,
-      finagle.param.Label,
-      finagle.param.Timer,
-      finagle.param.Stats,
-      ServiceFactory[Req, Rep]] {
+    new Stack.ModuleParams[ServiceFactory[Req, Rep]] {
       import FailureAccrualFactory.Param
       val role = FailureAccrualFactory.role
-      val description = "Memcached ketama failure accrual"
+      val description: String = "Memcached ketama failure accrual"
+      override def parameters: Seq[Stack.Param[_]] = Seq(
+        implicitly[Stack.Param[param.Stats]],
+        implicitly[Stack.Param[FailureAccrualFactory.Param]],
+        implicitly[Stack.Param[param.Timer]],
+        implicitly[Stack.Param[param.Label]],
+        implicitly[Stack.Param[param.Logger]],
+        implicitly[Stack.Param[param.ResponseClassifier]],
+        implicitly[Stack.Param[Transporter.EndpointAddr]]
+      )
 
-      def make(
-        failureAccrual: Param,
-        _ejectFailedHost: Memcached.param.EjectFailedHost,
-        _label: finagle.param.Label,
-        _timer: finagle.param.Timer,
-        _stats: finagle.param.Stats,
-        next: ServiceFactory[Req, Rep]
-      ) = failureAccrual match {
-          case Param.Configured(policy) =>
-            val Memcached.param.EjectFailedHost(ejectFailedHost) = _ejectFailedHost
-            val finagle.param.Timer(timer) = _timer
-            val finagle.param.Stats(stats) = _stats
-            val finagle.param.Label(label) = _label
-            new KetamaFailureAccrualFactory[Req, Rep](next, policy(), timer, key,
-              healthBroker, ejectFailedHost, label, stats)
+      def make(params: Stack.Params, next: ServiceFactory[Req, Rep]) =
+        params[FailureAccrualFactory.Param] match {
+            case Param.Configured(policy) =>
+              val Memcached.param.EjectFailedHost(ejectFailedHost) =
+                params[Memcached.param.EjectFailedHost]
+              val timer = params[finagle.param.Timer].timer
+              val stats = params[finagle.param.Stats].statsReceiver
+              val classifier = params[finagle.param.ResponseClassifier].responseClassifier
 
-          case Param.Replaced(f) =>
-            val param.Timer(timer) = _timer
-            f(timer) andThen next
+              val label = params[finagle.param.Label].label
+              val logger = params[finagle.param.Logger].log
+              val endpoint = params[Transporter.EndpointAddr].addr
 
-          case Param.Disabled => next
+              new KetamaFailureAccrualFactory[Req, Rep](
+                underlying = next,
+                policy = policy(),
+                responseClassifier = classifier,
+                statsReceiver = stats,
+                timer = timer,
+                key = key,
+                healthBroker = healthBroker,
+                ejectFailedHost = ejectFailedHost,
+                label = label) {
+                override def didMarkDead(): Unit = {
+                  logger.log(Level.INFO,
+                    s"""FailureAccrualFactory marking connection to "$label" as dead. """+
+                    s"""Remote Address: $endpoint. """+
+                    s"""Eject failed host from ring: $ejectFailedHost""")
+                  super.didMarkDead()
+                }
+              }
+
+            case Param.Replaced(f) =>
+              val timer = params[finagle.param.Timer].timer
+              f(timer).andThen(next)
+
+            case Param.Disabled => next
         }
     }
 }
@@ -782,39 +805,22 @@ private[finagle] object KetamaFailureAccrualFactory {
  */
 private[finagle] class KetamaFailureAccrualFactory[Req, Rep](
     underlying: ServiceFactory[Req, Rep],
-    failureAccrualPolicy: FailureAccrualPolicy,
+    policy: FailureAccrualPolicy,
+    responseClassifier: ResponseClassifier,
     timer: Timer,
+    statsReceiver: StatsReceiver,
     key: KetamaClientKey,
     healthBroker: Broker[NodeHealth],
     ejectFailedHost: Boolean,
-    label: String,
-    statsReceiver: StatsReceiver)
+    label: String)
   extends FailureAccrualFactory[Req, Rep](
     underlying,
-    failureAccrualPolicy,
+    policy,
+    responseClassifier,
     timer,
     statsReceiver)
 {
   import FailureAccrualFactory._
-
-  def this(
-    underlying: ServiceFactory[Req, Rep],
-    numFailures: Int,
-    markDeadFor: () => Duration,
-    timer: Timer,
-    key: KetamaClientKey,
-    healthBroker: Broker[NodeHealth],
-    ejectFailedHost: Boolean,
-    label: String
-  ) = this(
-    underlying,
-    FailureAccrualPolicy.consecutiveFailures(numFailures, Backoff.fromFunction(markDeadFor)),
-    timer,
-    key,
-    healthBroker,
-    ejectFailedHost,
-    label,
-    ClientStatsReceiver.scope("memcached_client"))
 
   private[this] val failureAccrualEx =
     Future.exception(new FailureAccrualException("Endpoint is marked dead by failureAccrual") { serviceName = label })
@@ -840,7 +846,7 @@ private[finagle] class KetamaFailureAccrualFactory[Req, Rep](
   // immediately after it is woken, so it can satisfy a probe request
   override def startProbing() = synchronized {
     super.startProbing()
-    if(ejectFailedHost) healthBroker ! NodeRevived(key)
+    if (ejectFailedHost) healthBroker ! NodeRevived(key)
   }
 
   override def apply(conn: ClientConnection): Future[Service[Req, Rep]] =
@@ -857,6 +863,14 @@ private[finagle] class KetamaFailureAccrualFactory[Req, Rep](
 }
 
 private[finagle] object KetamaPartitionedClient {
+
+  private object NodeState extends Enumeration {
+    type t = this.Value
+    val Live, Ejected = Value
+  }
+
+  private case class Node(node: KetamaNode[Client], var state: NodeState.Value)
+
   val DefaultNumReps = 160
 
   val shardNotAvailableDistributor: Distributor[Client] = {
@@ -882,15 +896,9 @@ private[finagle] class KetamaPartitionedClient(
     keyHasher: KeyHasher = KeyHasher.KETAMA,
     numReps: Int = KetamaPartitionedClient.DefaultNumReps,
     oldLibMemcachedVersionComplianceMode: Boolean = false)
-  extends PartitionedClient {
+  extends PartitionedClient { self =>
+
   import KetamaPartitionedClient._
-
-  private object NodeState extends Enumeration {
-    type t = this.Value
-    val Live, Ejected = Value
-  }
-
-  private case class Node(node: KetamaNode[Client], var state: NodeState.Value)
 
   // exposed for testing
   private[memcached] val ketamaNodeGrp: Group[(KetamaClientKey, KetamaNode[Client])] =
@@ -900,56 +908,63 @@ private[finagle] class KetamaPartitionedClient(
       key -> KetamaNode(key.identifier, node.weight, underlying)
     }
 
-  @volatile private[this] var ketamaNodeSnap = ketamaNodeGrp()
-  @volatile private[this] var nodes = mutable.Map[KetamaClientKey, Node]() ++ {
-    ketamaNodeSnap.toMap.mapValues { kn: KetamaNode[Client] => Node(kn, NodeState.Live) }
-  }
+  private[this] val nodes = mutable.Map[KetamaClientKey, Node]()
 
-  nodeHealthBroker.recv foreach {
-    case NodeMarkedDead(key) => ejectNode(key)
-    case NodeRevived(key) => reviveNode(key)
-  }
+  // We update those out of the request path so we need to make sure to synchronize on
+  // read-modify-write operations on `currentDistributor` and `distributor`.
+  // Note: Volatile-read from `clientOf` safety (not raciness) is guaranteed by JMM.
+  @volatile private[this] var currentDistributor: Distributor[Client] =
+    shardNotAvailableDistributor
+  @volatile private[this] var snapshot: immutable.Set[(KetamaClientKey, KetamaNode[Client])] =
+    immutable.Set.empty
 
-  private[this] val pristineDistributor = buildDistributor(nodes.values.map(_.node).toSeq)
-  @volatile private[this] var currentDistributor: Distributor[Client] = pristineDistributor
-
-  private[this] val liveNodeGauge = statsReceiver.addGauge("live_nodes") {
-    synchronized { nodes count { case (_, Node(_, state)) => state == NodeState.Live } } }
-  private[this] val deadNodeGauge = statsReceiver.addGauge("dead_nodes") {
-    synchronized { nodes count { case (_, Node(_, state)) => state == NodeState.Ejected } } }
   private[this] val ejectionCount = statsReceiver.counter("ejections")
   private[this] val revivalCount = statsReceiver.counter("revivals")
   private[this] val nodeLeaveCount = statsReceiver.counter("leaves")
   private[this] val nodeJoinCount = statsReceiver.counter("joins")
   private[this] val keyRingRedistributeCount = statsReceiver.counter("redistributes")
 
-  private[this] def buildDistributor(nodes: Seq[KetamaNode[Client]]) = synchronized {
-    if (nodes.isEmpty) shardNotAvailableDistributor
-    else new KetamaDistributor(nodes, numReps, oldLibMemcachedVersionComplianceMode)
+  statsReceiver.addGauge("live_nodes") {
+    self.synchronized { nodes.count { case (_, Node(_, state)) => state == NodeState.Live } }
+  }
+
+  statsReceiver.addGauge("dead_nodes") {
+    self.synchronized { nodes.count { case (_, Node(_, state)) => state == NodeState.Ejected } }
+  }
+
+  private[this] val ketamaNodeGrpChanges: Event[immutable.Set[((KetamaClientKey, KetamaNode[Client]))]] =
+    ketamaNodeGrp.set.changes.filter(_.nonEmpty)
+
+  // We listen for changes on a group to update the cache ring.
+  private[this] val listener: Closable = ketamaNodeGrpChanges.respond(updateGroup)
+
+  // We also listen on a broker to eject/revive cache nodes.
+  nodeHealthBroker.recv.foreach {
+    case NodeMarkedDead(key) => ejectNode(key)
+    case NodeRevived(key) => reviveNode(key)
   }
 
   override def clientOf(key: String): Client = {
-    if (ketamaNodeGrp() ne ketamaNodeSnap)
-      updateGroup()
-
     val bytes = key.getBytes(Charsets.Utf8)
     val hash = keyHasher.hashKey(bytes)
     currentDistributor.nodeForHash(hash)
   }
 
-  private[this] def rebuildDistributor(): Unit = synchronized {
-    val liveNodes = for ((_, Node(node, NodeState.Live)) <- nodes) yield node
-    currentDistributor = buildDistributor(liveNodes.toSeq)
+  private[this] def rebuildDistributor(): Unit = self.synchronized {
     keyRingRedistributeCount.incr()
+
+    val liveNodes = nodes.collect({ case (_, Node(node, NodeState.Live)) => node })(breakOut)
+
+    currentDistributor =
+      if (liveNodes.isEmpty) shardNotAvailableDistributor
+      else new KetamaDistributor(liveNodes, numReps, oldLibMemcachedVersionComplianceMode)
   }
 
-  private[this] def updateGroup() = synchronized {
-    if (ketamaNodeGrp() ne ketamaNodeSnap) {
-      val old = ketamaNodeSnap
-      ketamaNodeSnap = ketamaNodeGrp()
-
+  private[this] def updateGroup(current: immutable.Set[(KetamaClientKey, KetamaNode[Client])]): Unit =
+    self.synchronized {
+      val old = snapshot
       // remove old nodes and release clients
-      nodes --= (old &~ ketamaNodeSnap) collect {
+      nodes --= (old &~ current).collect {
         case (key, node) =>
           node.handle.release()
           nodeLeaveCount.incr()
@@ -957,19 +972,19 @@ private[finagle] class KetamaPartitionedClient(
       }
 
       // new joined node appears as Live state
-      nodes ++= (ketamaNodeSnap &~ old) collect {
+      nodes ++= (current &~ old).collect {
         case (key, node) =>
           nodeJoinCount.incr()
           key -> Node(node, NodeState.Live)
       }
 
+      snapshot = current
       rebuildDistributor()
     }
-  }
 
-  private[this] def ejectNode(key: KetamaClientKey) = synchronized {
+  private[this] def ejectNode(key: KetamaClientKey) = self.synchronized {
     nodes.get(key) match {
-      case Some(node) if (node.state == NodeState.Live) =>
+      case Some(node) if node.state == NodeState.Live =>
         node.state = NodeState.Ejected
         rebuildDistributor()
         ejectionCount.incr()
@@ -977,7 +992,7 @@ private[finagle] class KetamaPartitionedClient(
     }
   }
 
-  private[this] def reviveNode(key: KetamaClientKey) = synchronized {
+  private[this] def reviveNode(key: KetamaClientKey) = self.synchronized {
     nodes.get(key) match {
       case Some(node) if node.state == NodeState.Ejected =>
         node.state = NodeState.Live
@@ -991,39 +1006,47 @@ private[finagle] class KetamaPartitionedClient(
   // this readiness here will be fulfilled the first time the ketamaNodeGrp is updated
   // with non-empty content, after that group can still be updated with empty endpoints
   // which will throw NoShardAvailableException to users indicating the lost of cache access
-  val ready = ketamaNodeGrp.set.changes.filter(_.nonEmpty).toFuture.unit
-  override def getsResult(keys: Iterable[String]) = ready.interruptible before super.getsResult(keys)
+  val ready = ketamaNodeGrpChanges.toFuture().unit
 
-  override def getResult(keys: Iterable[String]) = ready.interruptible before super.getResult(keys)
+  override def getsResult(keys: Iterable[String]) =
+    ready.interruptible().before(super.getsResult(keys))
+
+  override def getResult(keys: Iterable[String]) =
+    ready.interruptible().before(super.getResult(keys))
 
   override def set(key: String, flags: Int, expiry: Time, value: Buf) =
-    ready.interruptible before super.set(key, flags, expiry, value)
+    ready.interruptible().before(super.set(key, flags, expiry, value))
 
-  override def delete(key: String) = ready.interruptible before super.delete(key)
+  override def delete(key: String) =
+    ready.interruptible().before(super.delete(key))
 
-  override def checkAndSet(key: String, flags: Int, expiry: Time,
-      value: Buf, casUnique: Buf) =
-    ready.interruptible before super.checkAndSet(key, flags, expiry, value, casUnique)
+  override def checkAndSet(key: String, flags: Int, expiry: Time, value: Buf, casUnique: Buf) =
+    ready.interruptible().before(super.checkAndSet(key, flags, expiry, value, casUnique))
 
   override def add(key: String, flags: Int, expiry: Time, value: Buf) =
-    ready.interruptible before super.add(key, flags, expiry, value)
+    ready.interruptible().before(super.add(key, flags, expiry, value))
 
   override def replace(key: String, flags: Int, expiry: Time, value: Buf) =
-    ready.interruptible before super.replace(key, flags, expiry, value)
+    ready.interruptible().before(super.replace(key, flags, expiry, value))
 
   override def prepend(key: String, flags: Int, expiry: Time, value: Buf) =
-    ready.interruptible before super.prepend(key, flags, expiry, value)
+    ready.interruptible().before(super.prepend(key, flags, expiry, value))
 
   override def append(key: String, flags: Int, expiry: Time, value: Buf) =
-    ready.interruptible before super.append(key, flags, expiry, value)
+    ready.interruptible().before(super.append(key, flags, expiry, value))
 
-  override def incr(key: String, delta: Long) = ready.interruptible before super.incr(key, delta)
+  override def incr(key: String, delta: Long) =
+    ready.interruptible().before(super.incr(key, delta))
 
-  override def decr(key: String, delta: Long) = ready.interruptible before super.decr(key, delta)
+  override def decr(key: String, delta: Long) =
+    ready.interruptible().before(super.decr(key, delta))
 
-  def release() = synchronized {
-    for ((_, Node(node, _)) <- nodes)
-      node.handle.release()
+  def release(): Unit = synchronized {
+    nodes.foreach { case (_, n) =>
+      n.node.handle.release()
+    }
+
+    listener.close()
   }
 }
 

@@ -16,7 +16,7 @@ extensions = ['sphinx.ext.extlinks', 'includecode']
 templates_path = ['_templates']
 source_suffix = '.rst'
 master_doc = 'index'
-exclude_patterns = ['metrics/*']
+exclude_patterns = ['metrics/*', 'shared-modules/*']
 
 sys.path.append(os.path.abspath('_themes'))
 html_theme_path = ['_themes']
@@ -53,6 +53,7 @@ extlinks = {
   'util-core-src':("https://github.com/twitter/util/blob/master/util-core/src/main/scala/%s", 'util-core github repo'),
   'finagle-mux-src':("https://github.com/twitter/finagle/blob/master/finagle-mux/src/main/scala/%s", 'finagle-mux github repo'),
   'finagle-http-src':("https://github.com/twitter/finagle/blob/master/finagle-http/src/main/scala/%s", 'finagle-http github repo'),
+  'finagle-netty4-src':("https://github.com/twitter/finagle/blob/master/finagle-netty4/src/main/scala/%s", 'finagle-netty4 github repo'),
   'finagle-thriftmux-src':("https://github.com/twitter/finagle/blob/master/finagle-thriftmux/src/main/scala/%s", 'finagle-thriftmux github repo'),
   'src':("https://github.com/twitter/finagle/blob/master/finagle-core/src/main/scala/%s", 'finagle-core github repo')
 }
