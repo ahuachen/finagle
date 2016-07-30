@@ -57,16 +57,13 @@ import org.apache.thrift.protocol.TProtocolFactory
  * @define clientExampleObject Thrift
  * @define serverExampleObject Thrift
  */
-object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichClient
-    with Server[Array[Byte], Array[Byte]] with ThriftRichServer {
+object Thrift extends Client[ThriftClientRequest, Array[Byte]]
+    with Server[Array[Byte], Array[Byte]] {
 
   val protocolFactory: TProtocolFactory = Protocols.binaryFactory()
 
-  protected lazy val Label(defaultClientName) = client.params[Label]
-
-  protected def params: Stack.Params = client.params
-
-  override protected lazy val Stats(stats) = client.params[Stats]
+  // Planned deprecation. Use `Thrift.Server.maxThriftBufferSize` instead.
+  val maxThriftBufferSize: Int = 16 * 1024
 
   object param {
     case class ClientId(clientId: Option[thrift.ClientId])
@@ -83,6 +80,7 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
      * A `Param` to control whether a framed transport should be used.
      * If this is set to false, a buffered transport is used.  Framed
      * transports are enabled by default.
+     *
      * @param enabled Whether a framed transport should be used.
      */
     case class Framed(enabled: Boolean)
@@ -91,18 +89,8 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     }
 
     /**
-     * A `Param` to set the max size of a reusable buffer for the thrift response.
-     * If the buffer size exceeds the specified value, the buffer is not reused,
-     * and a new buffer is used for the next thrift response.
-     * @param maxReusableBufferSize Max buffer size in bytes.
-     */
-    case class MaxReusableBufferSize(maxReusableBufferSize: Int)
-    implicit object MaxReusableBufferSize extends Stack.Param[MaxReusableBufferSize] {
-      val default = MaxReusableBufferSize(maxThriftBufferSize)
-    }
-
-    /**
      * A `Param` to control upgrading the thrift protocol to TTwitter.
+     *
      * @see The [[https://twitter.github.io/finagle/guide/Protocols.html?highlight=Twitter-upgraded#thrift user guide]] for details on Twitter-upgrade Thrift.
      */
     case class AttemptTTwitterUpgrade(upgrade: Boolean)
@@ -123,7 +111,7 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
         ) = {
           val Label(label) = params[Label]
           val param.ClientId(clientId) = params[param.ClientId]
-          val param.ProtocolFactory(pf) = params[param.ProtocolFactory]
+          val Thrift.param.ProtocolFactory(pf) = params[Thrift.param.ProtocolFactory]
           val preparer = new ThriftClientPreparer(pf, label, clientId)
           preparer.prepare(next, params)
         }
@@ -175,7 +163,14 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
       configured(param.ProtocolFactory(protocolFactory))
 
     def withClientId(clientId: thrift.ClientId): Client =
-      configured(param.ClientId(Some(clientId)))
+      configured(Thrift.param.ClientId(Some(clientId)))
+
+    /**
+     * Use a buffered transport instead of the default framed transport.
+     * In almost all cases, the default framed transport should be used.
+     */
+    def withBufferedTransport: Client =
+      configured(Thrift.param.Framed(false))
 
     def withAttemptTTwitterUpgrade: Client =
       configured(param.AttemptTTwitterUpgrade(true))
@@ -183,7 +178,7 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     def withNoAttemptTTwitterUpgrade: Client =
       configured(param.AttemptTTwitterUpgrade(false))
 
-    def clientId: Option[thrift.ClientId] = params[param.ClientId].clientId
+    def clientId: Option[thrift.ClientId] = params[Thrift.param.ClientId].clientId
 
     private[this] def deserializingClassifier: Client = {
       // Note: what type of deserializer used is important if none is specified
@@ -220,8 +215,8 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
       new DefaultLoadBalancingParams(this)
     override val withTransport: ClientTransportParams[Client] =
       new ClientTransportParams(this)
-    override val withSession: SessionParams[Client] =
-      new SessionParams(this)
+    override val withSession: ClientSessionParams[Client] =
+      new ClientSessionParams(this)
     override val withSessionQualifier: SessionQualificationParams[Client] =
       new SessionQualificationParams(this)
     override val withAdmissionControl: ClientAdmissionControlParams[Client] =
@@ -274,10 +269,26 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
         override val description = "Prepare TTwitter thrift connection"
         def make(params: Stack.Params, next: ServiceFactory[Array[Byte], Array[Byte]]) = {
           val Label(label) = params[Label]
-          val param.ProtocolFactory(pf) = params[param.ProtocolFactory]
+          val Thrift.param.ProtocolFactory(pf) = params[Thrift.param.ProtocolFactory]
           val preparer = new thrift.ThriftServerPreparer(pf, label)
           preparer.prepare(next, params)
         }
+    }
+
+    val maxThriftBufferSize: Int = 16 * 1024
+
+    object param {
+      /**
+       * A `Param` to set the max size of a reusable buffer for the thrift response.
+       * If the buffer size exceeds the specified value, the buffer is not reused,
+       * and a new buffer is used for the next thrift response.
+       *
+       * @param maxReusableBufferSize Max buffer size in bytes.
+       */
+      case class MaxReusableBufferSize(maxReusableBufferSize: Int)
+      implicit object MaxReusableBufferSize extends Stack.Param[MaxReusableBufferSize] {
+        val default = MaxReusableBufferSize(maxThriftBufferSize)
+      }
     }
 
     val stack: Stack[ServiceFactory[Array[Byte], Array[Byte]]] = StackServer.newStack
@@ -324,6 +335,8 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     // See https://issues.scala-lang.org/browse/SI-8905
     override val withAdmissionControl: ServerAdmissionControlParams[Server] =
       new ServerAdmissionControlParams(this)
+    override val withSession: SessionParams[Server] =
+      new SessionParams(this)
     override val withTransport: ServerTransportParams[Server] =
       new ServerTransportParams(this)
 

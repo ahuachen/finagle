@@ -191,6 +191,8 @@ object Netty3Transporter {
     new Transporter[In, Out] {
       def apply(sa: SocketAddress): Future[Transport[In, Out]] =
         transporter(sa, stats)
+
+      override def toString: String = "Netty3Transporter"
     }
   }
 }
@@ -320,7 +322,6 @@ case class Netty3Transporter[In, Out](
 
       val engine = newEngine(addr)
       engine.self.setUseClientMode(true)
-      engine.self.setEnableSessionCreation(true)
 
       val verifier = verifyHost
         .map(SessionVerifier.hostname)
@@ -384,4 +385,6 @@ case class Netty3Transporter[In, Out](
       newTransport, statsReceiver)
     conn(addr)
   }
+
+  override def toString: String = "Netty3Transporter"
 }

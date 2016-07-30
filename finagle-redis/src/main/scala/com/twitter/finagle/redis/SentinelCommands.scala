@@ -1,16 +1,11 @@
 package com.twitter.finagle.redis
 
-import java.lang.{ Long => JLong, Boolean => JBoolean }
-import java.net.InetAddress
 import java.net.InetSocketAddress
 import com.twitter.finagle.redis.protocol._
-import com.twitter.finagle.redis.protocol.commands._
 import com.twitter.finagle.redis.util._
 import com.twitter.util.Future
-import org.jboss.netty.buffer.ChannelBuffer
-import scala.collection.immutable.{ Set => ImmutableSet }
 
-trait SentinelCommands { self: BaseClient =>
+private[redis] trait SentinelCommands { self: BaseClient =>
 
   import SentinelClient._
 
@@ -25,13 +20,13 @@ trait SentinelCommands { self: BaseClient =>
    * Show a list of monitored masters and their state.
    */
   def masters(): Future[Seq[MasterNode]] =
-    doRequest(SentinelMasters()) {
+    doRequest(SentinelMasters) {
       case MBulkReply(masters) => Future.value(
         masters.map {
           case MBulkReply(messages) => new MasterNode(
             returnMap(ReplyFormat.toString(messages)))
         })
-      case EmptyMBulkReply() => Future.value(Nil)
+      case EmptyMBulkReply => Future.Nil
     }
 
   /**
@@ -53,7 +48,7 @@ trait SentinelCommands { self: BaseClient =>
           case MBulkReply(messages) =>
             new SlaveNode(returnMap(ReplyFormat.toString(messages)))
         })
-      case EmptyMBulkReply() => Future.value(Nil)
+      case EmptyMBulkReply => Future.value(Nil)
     }
 
   /**
@@ -66,7 +61,7 @@ trait SentinelCommands { self: BaseClient =>
           case MBulkReply(messages) =>
             new SentinelNode(returnMap(ReplyFormat.toString(messages)))
         })
-      case EmptyMBulkReply() => Future.value(Nil)
+      case EmptyMBulkReply => Future.value(Nil)
     }
 
   /**
@@ -76,8 +71,7 @@ trait SentinelCommands { self: BaseClient =>
    */
   def getMasterAddrByName(name: String): Future[Option[InetSocketAddress]] =
     doRequest(SentinelGetMasterAddrByName(name)) {
-      case NilMBulkReply() =>
-        Future.value(None)
+      case NilMBulkReply => Future.None
       case MBulkReply(messages) => Future.value(
         ReplyFormat.toChannelBuffers(messages) match {
           case host :: port :: Nil =>
@@ -117,7 +111,7 @@ trait SentinelCommands { self: BaseClient =>
    * current Sentinel state.
    */
   def flushConfig(): Future[Unit] =
-    doRequest(SentinelFlushConfig()) {
+    doRequest(SentinelFlushConfig) {
       case StatusReply(msg) => Future.Unit
     }
 

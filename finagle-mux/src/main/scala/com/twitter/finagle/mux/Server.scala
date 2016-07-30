@@ -6,18 +6,15 @@ import com.twitter.finagle._
 import com.twitter.finagle.context.{Contexts, RemoteInfo}
 import com.twitter.finagle.mux.lease.exp.{Lessee, Lessor, nackOnExpiredLease}
 import com.twitter.finagle.mux.transport.Message
-import com.twitter.finagle.netty3.{BufChannelBuffer, ChannelBufferBuf}
 import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
 import com.twitter.finagle.tracing.{NullTracer, Trace, Tracer}
 import com.twitter.finagle.transport.Transport
 import com.twitter.finagle.util.DefaultTimer
-import com.twitter.io.Buf
 import com.twitter.logging.HasLogLevel
 import com.twitter.util._
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.logging.{Level, Logger}
-import org.jboss.netty.buffer.ChannelBuffer
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
@@ -199,6 +196,8 @@ private[twitter] class ServerDispatcher(
   private[this] implicit val injectTimer = DefaultTimer.twitter
   private[this] val tracker = new Tracker[Message]
   private[this] val log = Logger.getLogger(getClass.getName)
+  private[this] val duplicateTagCounter = statsReceiver.counter("duplicate_tag")
+  private[this] val orphanedTdiscardCounter = statsReceiver.counter("orphaned_tdiscard")
 
   private[this] val state: AtomicReference[State.Value] =
     new AtomicReference(State.Open)
@@ -245,7 +244,7 @@ private[twitter] class ServerDispatcher(
         // In both cases, we forfeit the ability to track (and thus drain or interrupt)
         // the request, but we can still service it.
         log.fine(s"Received duplicate tag ${m.tag} from client ${trans.remoteAddress}")
-        statsReceiver.counter("duplicate_tag").incr()
+        duplicateTagCounter.incr()
         service(m).transform(reply)
       }
 
@@ -266,6 +265,7 @@ private[twitter] class ServerDispatcher(
         case Some(reply) =>
           reply.raise(new ClientDiscardedRequestException(why))
         case None =>
+          orphanedTdiscardCounter.incr()
       }
 
     case Message.Rdrain(1) if state.get == State.Draining =>
@@ -338,7 +338,7 @@ private[twitter] class ServerDispatcher(
 
     statsReceiver.counter("draining").incr()
     val done = write(Message.Tdrain(1)) before
-      tracker.drained.within(deadline-Time.now) before
+      tracker.drained.by(deadline) before
       trans.close(deadline)
     done.transform {
       case Return(_) =>
@@ -385,23 +385,17 @@ private[twitter] class ServerDispatcher(
 private[finagle] object Processor extends Filter[Message, Message, Request, Response] {
   import Message._
 
-  private[this] val ContextsToBufs: ((ChannelBuffer, ChannelBuffer)) => ((Buf, Buf)) = {
-    case (k, v) =>
-      (ChannelBufferBuf.Owned(k.duplicate), ChannelBufferBuf.Owned(v.duplicate))
-  }
-
   private[this] def dispatch(
     tdispatch: Message.Tdispatch,
     service: Service[Request, Response]
   ): Future[Message] = {
-    val contextBufs = tdispatch.contexts.map(ContextsToBufs)
 
-    Contexts.broadcast.letUnmarshal(contextBufs) {
+    Contexts.broadcast.letUnmarshal(tdispatch.contexts) {
       if (tdispatch.dtab.nonEmpty)
         Dtab.local ++= tdispatch.dtab
-      service(Request(tdispatch.dst, ChannelBufferBuf.Owned(tdispatch.req))).transform {
+      service(Request(tdispatch.dst, tdispatch.req)).transform {
         case Return(rep) =>
-          Future.value(RdispatchOk(tdispatch.tag, Nil, BufChannelBuffer(rep.body)))
+          Future.value(RdispatchOk(tdispatch.tag, Nil, rep.body))
 
         case Throw(f: Failure) if f.isFlagged(Failure.Restartable) =>
           Future.value(RdispatchNack(tdispatch.tag, Nil))
@@ -417,9 +411,9 @@ private[finagle] object Processor extends Filter[Message, Message, Request, Resp
     service: Service[Request, Response]
   ): Future[Message] = {
     Trace.letIdOption(treq.traceId) {
-      service(Request(Path.empty, ChannelBufferBuf.Owned(treq.req))).transform {
+      service(Request(Path.empty, treq.req)).transform {
         case Return(rep) =>
-          Future.value(RreqOk(treq.tag, BufChannelBuffer(rep.body)))
+          Future.value(RreqOk(treq.tag, rep.body))
 
         case Throw(f: Failure) if f.isFlagged(Failure.Restartable) =>
           Future.value(Message.RreqNack(treq.tag))

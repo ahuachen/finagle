@@ -1,16 +1,17 @@
 package com.twitter.finagle.netty4
 
+import com.twitter.conversions.time._
 import com.twitter.finagle.Stack.Params
 import com.twitter.finagle.dispatch.SerialServerDispatcher
+import com.twitter.finagle.netty4.Netty4Listener.BackPressure
 import com.twitter.finagle.param.{Stats, Label}
 import com.twitter.finagle.stats.InMemoryStatsReceiver
 import com.twitter.finagle.transport.Transport
 import com.twitter.finagle.{Service, Status}
 import com.twitter.io.Charsets
 import com.twitter.util._
-import io.netty.buffer.ByteBuf
-import io.netty.channel.ChannelPipeline
-import io.netty.channel.socket.SocketChannel
+import io.netty.buffer.{Unpooled, ByteBuf}
+import io.netty.channel.{Channel, ChannelPipeline}
 import io.netty.handler.codec.string.{StringDecoder, StringEncoder}
 import io.netty.handler.codec.{Delimiters, DelimiterBasedFrameDecoder}
 import java.net.{SocketAddress, InetAddress, Socket, InetSocketAddress}
@@ -22,6 +23,14 @@ import org.scalatest.junit.JUnitRunner
 
 @RunWith(classOf[JUnitRunner])
 class Netty4ListenerTest extends FunSuite with Eventually with IntegrationPatience {
+
+  object StringServerInit extends (ChannelPipeline => Unit) {
+    def apply(pipeline: ChannelPipeline): Unit = {
+      pipeline.addLast("line", new DelimiterBasedFrameDecoder(100, Delimiters.lineDelimiter(): _*))
+      pipeline.addLast("stringDecoder", new StringDecoder(Charsets.Utf8))
+      pipeline.addLast("stringEncoder", new StringEncoder(Charsets.Utf8))
+    }
+  }
 
   // a Transport whose reads and writes never complete
   private[netty4] class NullTransport[In,Out] extends Transport[In, Out] {
@@ -59,10 +68,13 @@ class Netty4ListenerTest extends FunSuite with Eventually with IntegrationPatien
   }
 
   private[this] trait Ctx extends StatsCtx {
-    val p = Params.empty + Label("test") + Stats(sr)
+    def backpressure: Boolean = true
+
+    val p = Params.empty + Label("test") + Stats(sr) + BackPressure(backpressure)
     val listener = Netty4Listener[ByteBuf, ByteBuf](
-      p,
-      transportFactory = { _: SocketChannel => new NullTransport }
+      pipelineInit = _ => (),
+      params = p,
+      transportFactory = { _: Channel => new NullTransport }
     )
   }
 
@@ -71,16 +83,8 @@ class Netty4ListenerTest extends FunSuite with Eventually with IntegrationPatien
     val ctx = new StatsCtx { }
     import ctx._
 
-    object StringServerInit extends (ChannelPipeline => Unit) {
-      def apply(pipeline: ChannelPipeline): Unit = {
-        pipeline.addLast("line", new DelimiterBasedFrameDecoder(100, Delimiters.lineDelimiter(): _*))
-        pipeline.addLast("stringDecoder", new StringDecoder(Charsets.Utf8))
-        pipeline.addLast("stringEncoder", new StringEncoder(Charsets.Utf8))
-      }
-    }
-
-    val p = Params.empty + Label("test") + Stats(sr) + PipelineInit(StringServerInit)
-    val listener = Netty4Listener[String, String](p)
+    val p = Params.empty + Label("test") + Stats(sr)
+    val listener = Netty4Listener[String, String](StringServerInit, p)
 
     @volatile var observedRequest: Option[String] = None
 
@@ -105,17 +109,47 @@ class Netty4ListenerTest extends FunSuite with Eventually with IntegrationPatien
     val expected = "hi2u"
     val actual = new String(Array.fill("hi2u".length)(response.read().toByte))
     assert(actual == expected)
-    server.close()
+    Await.ready(server.close(), 2.seconds)
+  }
+
+  test("bytebufs in default pipeline have refCnt == 1") {
+    val ctx = new StatsCtx { }
+    import ctx._
+
+    val p = Params.empty + Label("test") + Stats(sr)
+    val listener = Netty4Listener[ByteBuf, ByteBuf](pipelineInit = _ => (), params = p)
+
+    val requestBB = new Promise[ByteBuf]
+    val service = new Service[ByteBuf, ByteBuf] {
+      def apply(request: ByteBuf) = {
+        requestBB.setValue(request)
+        Future.value(Unpooled.wrappedBuffer("hi".getBytes("UTF-8")))
+      }
+    }
+
+    val serveTransport = (t: Transport[ByteBuf, ByteBuf]) => new SerialServerDispatcher(t, service)
+    val server = listener.listen(new InetSocketAddress(InetAddress.getLoopbackAddress, 0))(serveTransport(_))
+
+    val client = new Socket()
+    eventually { client.connect(server.boundAddress) }
+    client.getOutputStream.write("hello netty4!\n".getBytes("UTF-8"))
+    client.getOutputStream.flush()
+
+    val bb = Await.result(requestBB, 2.seconds)
+    assert(bb.refCnt == 1)
+    Await.ready(server.close(), 2.seconds)
   }
 
   test("Netty4Listener records basic channel stats") {
     val ctx = new StatsCtx { }
     import ctx._
 
-    val p = Params.empty + Label("srv") + Stats(sr)
+    // need to turn off backpressure since we don't read off the transport
+    val p = Params.empty + Label("srv") + Stats(sr) + BackPressure(false)
     val listener = Netty4Listener[ByteBuf, ByteBuf](
-        p,
-        transportFactory = { _: SocketChannel => new NullTransport }
+        pipelineInit = _ => (),
+        params = p,
+        transportFactory = { _: Channel => new NullTransport }
       )
     val server1 = listener.listen(new InetSocketAddress(InetAddress.getLoopbackAddress, 0))(nopDispatch)
     val server2 = listener.listen(new InetSocketAddress(InetAddress.getLoopbackAddress, 0))(nopDispatch)
@@ -133,12 +167,15 @@ class Netty4ListenerTest extends FunSuite with Eventually with IntegrationPatien
     client2.getOutputStream.write(1)
     eventually { counterEquals("received_bytes")(4) }
 
-    server1.close()
-    server2.close()
+    Await.ready(server1.close(), 2.seconds)
+    Await.ready(server2.close(), 2.seconds)
   }
 
   test("Netty4Listener shuts down gracefully") {
-    val c = new Ctx {}
+
+    // turn off backpressure so that the three bytes
+    // are recorded below.
+    val c = new Ctx { override def backpressure = false }
     import c._
 
     val serverAddr = new InetSocketAddress(InetAddress.getLoopbackAddress, 0)
@@ -152,7 +189,7 @@ class Netty4ListenerTest extends FunSuite with Eventually with IntegrationPatien
     eventually { counterEquals("connects")(3) }
 
     // listening socket is closed
-    Await.ready(server.close(), Duration.fromSeconds(15))
+    Await.ready(server.close(Time.Top), Duration.fromSeconds(15))
 
     // new connection attempts fail
     intercept[java.net.ConnectException] { new Socket().connect(server.boundAddress) }
@@ -163,5 +200,47 @@ class Netty4ListenerTest extends FunSuite with Eventually with IntegrationPatien
     client3.getOutputStream.write(1)
 
     eventually { counterEquals("received_bytes")(3) }
+    Await.ready(server.close(), 2.seconds)
+  }
+
+  test("Netty4Listener notices when the client cuts the connection with autoread enabled") {
+    val ctx = new StatsCtx { }
+    import ctx._
+
+    // we need to turn backpressure off because netty doesn't notify you if the
+    // client cut the connection unless you're reading or writing.  disabling
+    // backpressure turns on autoread, so netty will alert us immediately that
+    // the connection was cut.
+    val params = Params.empty + Label("test") + Stats(sr) + BackPressure(false)
+    val listener = Netty4Listener[String, String](StringServerInit, params)
+
+    @volatile var observedRequest: Option[String] = None
+
+    val p = Promise[String]()
+    @volatile var interrupted = false
+    p.setInterruptHandler { case NonFatal(t) =>
+      interrupted = true
+    }
+    val service = new Service[String, String] {
+      def apply(request: String) = {
+        observedRequest = Some(request)
+        p
+      }
+    }
+
+    val serveTransport = (t: Transport[String, String]) => new SerialServerDispatcher(t, service)
+    val server = listener.listen(new InetSocketAddress(InetAddress.getLoopbackAddress, 0))(serveTransport(_))
+
+    val client = new Socket()
+    eventually { client.connect(server.boundAddress) }
+    client.getOutputStream.write("hello netty4!\n".getBytes("UTF-8"))
+    client.getOutputStream.flush()
+
+    eventually { assert(observedRequest == Some("hello netty4!")) }
+
+    client.close()
+    eventually { assert(interrupted) }
+
+    Await.ready(server.close(), 2.seconds)
   }
 }

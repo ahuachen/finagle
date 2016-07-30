@@ -6,11 +6,12 @@ import com.twitter.finagle.client._
 import com.twitter.finagle.dispatch.GenSerialClientDispatcher
 import com.twitter.finagle.filter.PayloadSizeFilter
 import com.twitter.finagle.http._
-import com.twitter.finagle.http.exp.{StreamTransport, HttpTransport => ExpHttpTransport,
-  HttpClientDispatcher => ExpHttpClientDispatcher, HttpServerDispatcher => ExpHttpServerDispatcher}
-import com.twitter.finagle.http.filter.{ClientContextFilter, DtabFilter, HttpNackFilter,
+import com.twitter.finagle.http.codec.{HttpClientDispatcher, HttpServerDispatcher}
+import com.twitter.finagle.http.exp.StreamTransport
+import com.twitter.finagle.http.filter.{ClientContextFilter, HttpNackFilter,
   ServerContextFilter}
-import com.twitter.finagle.http.netty.{Netty3ClientStreamTransport, Netty3ServerStreamTransport, Netty3HttpTransporter, Netty3HttpListener}
+import com.twitter.finagle.http.netty.{Netty3ClientStreamTransport, Netty3ServerStreamTransport,
+  Netty3HttpTransporter, Netty3HttpListener}
 import com.twitter.finagle.netty3._
 import com.twitter.finagle.param.{Monitor => _, ResponseClassifier => _, ExceptionStatsHandler => _,
   Tracer => _, _}
@@ -48,27 +49,23 @@ object Http extends Client[Request, Response] with HttpRichClient
     with Server[Request, Response] {
 
   object param {
-
-    /**
-     * the transporter, useful for changing underlying http implementations
-     */
-    private[finagle] case class ParameterizableTransporter(
-      transporterFn: Stack.Params => Transporter[Any, Any])
-
     /**
      * configure alternative http 1.1 implementations
      *
-     * note: the listener and transporter don't strictly need to be
-     *       coupled but we do so for ease of configuration.
+     * @param clientTransport client [[StreamTransport]] factory
+     * @param serverTransport server [[StreamTransport]] factory
+     * @param transporter [[Transporter]] factory
+     * @param listener [[Listener]] factory
+     * @param ioEngineName name of the underlying i/o multiplexer (ie; netty4)
      */
-    private[finagle] case class HttpImpl(
+    case class HttpImpl(
       clientTransport: Transport[Any, Any] => StreamTransport[Request, Response],
       serverTransport: Transport[Any, Any] => StreamTransport[Response, Request],
       transporter: Stack.Params => Transporter[Any, Any],
       listener: Stack.Params => Listener[Any, Any]
     )
 
-    private[finagle] implicit object HttpImpl extends Stack.Param[HttpImpl] {
+    implicit object HttpImpl extends Stack.Param[HttpImpl] {
       val default = Netty3Impl
     }
 
@@ -157,6 +154,7 @@ object Http extends Client[Request, Response] with HttpRichClient
   object Client {
     val stack: Stack[ServiceFactory[Request, Response]] =
       StackClient.newStack
+        .insertBefore(StackClient.Role.prepConn, ClientContextFilter.module)
         .replace(StackClient.Role.prepConn, DelayedRelease.module)
         .replace(StackClient.Role.prepFactory, DelayedRelease.module)
         .replace(TraceInitializerFilter.role, new HttpClientTraceInitializer[Request, Response])
@@ -178,24 +176,22 @@ object Http extends Client[Request, Response] with HttpRichClient
     protected def newStreamTransport(
       transport: Transport[Any, Any]
     ): StreamTransport[Request, Response] =
-      new ExpHttpTransport(params[HttpImpl].clientTransport(transport))
+      new HttpTransport(params[HttpImpl].clientTransport(transport))
 
-    protected def newTransporter(): Transporter[Any, Any] =
+    protected def newTransporter(): Transporter[Any, Any] = {
       params[param.HttpImpl].transporter(params)
+    }
 
     protected def copy1(
       stack: Stack[ServiceFactory[Request, Response]] = this.stack,
       params: Stack.Params = this.params
     ): Client = copy(stack, params)
 
-    protected def newDispatcher(transport: Transport[Any, Any]): Service[Request, Response] = {
-      val dispatcher = new ExpHttpClientDispatcher(
+    protected def newDispatcher(transport: Transport[Any, Any]): Service[Request, Response] =
+      new HttpClientDispatcher(
         newStreamTransport(transport),
         params[Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
       )
-
-      new ClientContextFilter[Request, Response].andThen(dispatcher)
-    }
 
     def withTls(cfg: Netty3TransporterTLSConfig): Client =
       configured(Transport.TLSClientEngine(Some(cfg.newEngine)))
@@ -264,8 +260,8 @@ object Http extends Client[Request, Response] with HttpRichClient
       new SessionQualificationParams(this)
     override val withAdmissionControl: ClientAdmissionControlParams[Client] =
       new ClientAdmissionControlParams(this)
-    override val withSession: SessionParams[Client] =
-      new SessionParams(this)
+    override val withSession: ClientSessionParams[Client] =
+      new ClientSessionParams(this)
     override val withTransport: ClientTransportParams[Client] =
       new ClientTransportParams(this)
 
@@ -301,6 +297,7 @@ object Http extends Client[Request, Response] with HttpRichClient
         .replace(TraceInitializerFilter.role, new HttpServerTraceInitializer[Request, Response])
         .replace(StackServer.Role.preparer, HttpNackFilter.module)
         .prepend(nonChunkedPayloadSize)
+        .prepend(ServerContextFilter.module)
   }
 
   case class Server(
@@ -311,25 +308,23 @@ object Http extends Client[Request, Response] with HttpRichClient
     protected type In = Any
     protected type Out = Any
 
-    protected def newListener(): Listener[Any, Any] =
+    protected def newListener(): Listener[Any, Any] = {
       params[param.HttpImpl].listener(params)
+    }
 
     protected def newStreamTransport(
       transport: Transport[Any, Any]
     ): StreamTransport[Response, Request] =
-      new ExpHttpTransport(params[HttpImpl].serverTransport(transport))
+      new HttpTransport(params[HttpImpl].serverTransport(transport))
 
-    protected def newDispatcher(transport: Transport[In, Out],
-        service: Service[Request, Response]) = {
-      val dtab = new DtabFilter.Finagle[Request]
-      val context = new ServerContextFilter[Request, Response]
+    protected def newDispatcher(
+      transport: Transport[In, Out],
+      service: Service[Request, Response]
+    ) = {
       val Stats(stats) = params[Stats]
-
-      val endpoint = dtab.andThen(context).andThen(service)
-
-      new ExpHttpServerDispatcher(
+      new HttpServerDispatcher(
         newStreamTransport(transport),
-        endpoint,
+        service,
         stats.scope("dispatch"))
     }
 
@@ -392,6 +387,8 @@ object Http extends Client[Request, Response] with HttpRichClient
       new ServerAdmissionControlParams(this)
     override val withTransport: ServerTransportParams[Server] =
       new ServerTransportParams[Server](this)
+    override val withSession: SessionParams[Server] =
+      new SessionParams(this)
 
     override def withResponseClassifier(responseClassifier: service.ResponseClassifier): Server =
       super.withResponseClassifier(responseClassifier)

@@ -4,11 +4,12 @@ import com.twitter.conversions.time._
 import com.twitter.finagle.Stack.Params
 import com.twitter.finagle.{ReadTimedOutException, WriteTimedOutException, Failure}
 import com.twitter.finagle.client.Transporter
-import com.twitter.finagle.codec.{FrameEncoder, FixedLengthDecoder}
+import com.twitter.finagle.framer.FixedLengthFramer
 import com.twitter.finagle.transport.Transport
 import com.twitter.finagle.util.InetSocketAddressUtil
 import com.twitter.io.Buf
 import com.twitter.util.{Duration, Await}
+import io.netty.buffer.{Unpooled, ByteBuf}
 import io.netty.channel._
 import java.net.{Socket, InetSocketAddress, InetAddress, ServerSocket}
 import org.junit.runner.RunWith
@@ -22,25 +23,30 @@ class Netty4TransporterTest extends FunSuite with Eventually with IntegrationPat
   val frameSize = 4
   val data = "hello world"
   val defaultEnc = Buf.Utf8(_)
-  def defaultDec = new FixedLengthDecoder(frameSize, Buf.Utf8.unapply(_).getOrElse("????"))
+  val defaultDec = Buf.Utf8.unapply(_: Buf).getOrElse("???")
+
+  val framer = () => new FixedLengthFramer(frameSize)
   def params = Params.empty
 
-  private[this] class Ctx[A](transporter: Transporter[A, String]) {
-    var clientsideTransport: Transport[A, String] = null
+  private[this] class Ctx[A, B](
+      transporter: Transporter[Buf, Buf],
+      dec: Buf => B,
+      enc: A => Buf) {
+    var clientsideTransport: Transport[A, B] = null
     var server: ServerSocket = null
     var acceptedSocket: Socket = null
 
     def connect() = {
       server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress)
       val f = transporter(new InetSocketAddress(InetAddress.getLoopbackAddress, server.getLocalPort))
-
+          .map(_.map(enc, dec))
       acceptedSocket = server.accept()
       clientsideTransport = Await.result(f, timeout)
     }
   }
 
   test("connection failures are propagated to the transporter promise") {
-    val transporter = Netty4Transporter(None, None, Params.empty)
+    val transporter = Netty4Transporter(Some(framer), Params.empty)
 
     val p = transporter(InetSocketAddressUtil.unconnected)
 
@@ -54,8 +60,29 @@ class Netty4TransporterTest extends FunSuite with Eventually with IntegrationPat
     }
   }
 
+  test("interrupts on read cut connections") {
+    new Ctx(Netty4Transporter(Some(framer), params), defaultDec, defaultEnc) {
+      connect()
+
+      val read = clientsideTransport.read()
+
+      assert(!server.isClosed)
+      val expected = new Exception("boom!")
+      read.raise(expected)
+      val actual = intercept[Exception] {
+        Await.result(read, 5.seconds)
+      }
+      assert(actual == expected)
+
+      Await.result(clientsideTransport.onClose, 5.seconds)
+
+      assert(acceptedSocket.getInputStream().read() == -1)
+      server.close()
+    }
+  }
+
   test("Netty4ClientChannelInitializer produces a readable Transport") {
-    new Ctx(Netty4Transporter(Some(defaultEnc), Some(() => defaultDec), params)) {
+    new Ctx(Netty4Transporter(Some(framer), params), defaultDec, defaultEnc) {
       connect()
 
       val os = acceptedSocket.getOutputStream
@@ -76,7 +103,7 @@ class Netty4TransporterTest extends FunSuite with Eventually with IntegrationPat
   }
 
   test("Netty4ClientChannelInitializer produces a writable Transport") {
-    new Ctx(Netty4Transporter(Some(defaultEnc), Some(() => defaultDec), params)) {
+    new Ctx(Netty4Transporter(Some(framer), params), defaultDec, defaultEnc) {
       connect()
 
       Await.ready(clientsideTransport.write(data), timeout)
@@ -92,10 +119,9 @@ class Netty4TransporterTest extends FunSuite with Eventually with IntegrationPat
   }
 
   test("end to end: asymmetric protocol") {
-    val enc: FrameEncoder[Int] = { i: Int => Buf.ByteArray.Owned(Array(i.toByte)) }
-    def dec =
-      new FixedLengthDecoder[String](4, Buf.Utf8.unapply(_).getOrElse("???"))
-    new Ctx(Netty4Transporter(Some(enc), Some(() => dec), params)) {
+    val enc = { i: Int => Buf.ByteArray.Owned(Array(i.toByte)) }
+
+    new Ctx(Netty4Transporter(Some(framer), params), defaultDec, enc) {
       connect()
       clientsideTransport.write(123)
       val serverInputStream = acceptedSocket.getInputStream
@@ -105,9 +131,28 @@ class Netty4TransporterTest extends FunSuite with Eventually with IntegrationPat
 
       assert(Await.result(clientsideTransport.read(), timeout) == "hell")
       assert(Await.result(clientsideTransport.read(), timeout) == "o wo")
+
+      server.close()
     }
   }
 
+  test("listener pipeline emits byte bufs with refCnt == 1") {
+    val transporter = Netty4Transporter[ByteBuf, ByteBuf]({pipe: ChannelPipeline => ()}, params)
+    val server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress)
+    val transFuture = transporter(new InetSocketAddress(InetAddress.getLoopbackAddress, server.getLocalPort))
+    val acceptedSocket = server.accept()
+    val clientsideTransport = Await.result(transFuture, timeout)
+
+    val requestBytes = "hello world request".getBytes("UTF-8")
+    val in = Unpooled.wrappedBuffer(requestBytes)
+    clientsideTransport.write(in)
+
+    val responseBytes = "some response".getBytes("UTF-8")
+    acceptedSocket.getOutputStream.write(responseBytes)
+
+    val responseBB = Await.result(clientsideTransport.read(), timeout)
+    assert(responseBB.refCnt == 1)
+  }
 
   test("Netty4ClientChannelInitializer pipelines enforce read timeouts") {
     @volatile var observedExn: Throwable = null
@@ -119,7 +164,8 @@ class Netty4TransporterTest extends FunSuite with Eventually with IntegrationPat
     }
     new Ctx(Netty4Transporter({pipeline: ChannelPipeline =>
       pipeline.addLast(exnSnooper)
-    }, params + Transport.Liveness(readTimeout = 1.millisecond, Duration.Top, None))) {
+    }, params + Transport.Liveness(readTimeout = 1.millisecond, Duration.Top, None)),
+      defaultDec, defaultEnc) {
       connect()
     }
 
@@ -143,11 +189,12 @@ class Netty4TransporterTest extends FunSuite with Eventually with IntegrationPat
         ()
     }
 
-    new Ctx(Netty4Transporter[String, String]({pipeline: ChannelPipeline =>
+    new Ctx(Netty4Transporter({pipeline: ChannelPipeline =>
       pipeline.addLast (exnSnooper)
       pipeline.addFirst (writeSwallower)
       ()
-    }, params + Transport.Liveness(Duration.Top, writeTimeout = 1.millisecond, None))) {
+    }, params + Transport.Liveness(Duration.Top, writeTimeout = 1.millisecond, None)),
+      defaultDec, defaultEnc) {
       connect()
       clientsideTransport.write("msg")
     }

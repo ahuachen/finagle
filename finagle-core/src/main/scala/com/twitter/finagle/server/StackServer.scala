@@ -1,17 +1,17 @@
 package com.twitter.finagle.server
 
 import com.twitter.conversions.time._
-import com.twitter.finagle.Stack.{Role, Param}
 import com.twitter.finagle._
 import com.twitter.finagle.filter._
 import com.twitter.finagle.param._
-import com.twitter.finagle.service.{DeadlineFilter, StatsFilter, TimeoutFilter}
+import com.twitter.finagle.service.{ExpiringService, DeadlineStatsFilter, StatsFilter, TimeoutFilter}
 import com.twitter.finagle.stack.Endpoint
+import com.twitter.finagle.Stack.{Role, Param}
 import com.twitter.finagle.stats.ServerStatsReceiver
-import com.twitter.finagle.tracing.TraceInitializerFilter.Module
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.Transport
 import com.twitter.jvm.Jvm
+import com.twitter.util.registry.GlobalRegistry
 import com.twitter.util.{Closable, CloseAwaitably, Future, Return, Throw, Time}
 import java.net.SocketAddress
 import java.util.Collections
@@ -20,7 +20,7 @@ import scala.collection.JavaConverters._
 
 object StackServer {
 
-  private[this] val newJvmFilter = new MkJvmFilter(Jvm())
+  private[this] lazy val newJvmFilter = new MkJvmFilter(Jvm())
 
   private[this] class JvmTracing[Req, Rep] extends Stack.Module1[param.Tracer, ServiceFactory[Req, Rep]] {
     override def role: Role = Role.jvmTracing
@@ -50,7 +50,7 @@ object StackServer {
    *
    * @see [[com.twitter.finagle.tracing.ServerDestTracingProxy]]
    * @see [[com.twitter.finagle.service.TimeoutFilter]]
-   * @see [[com.twitter.finagle.service.DeadlineFilter]]
+   * @see [[com.twitter.finagle.service.DeadlineStatsFilter]]
    * @see [[com.twitter.finagle.filter.DtabStatsFilter]]
    * @see [[com.twitter.finagle.service.StatsFilter]]
    * @see [[com.twitter.finagle.filter.RequestSemaphoreFilter]]
@@ -65,15 +65,14 @@ object StackServer {
     val stk = new StackBuilder[ServiceFactory[Req, Rep]](
       stack.nilStack[Req, Rep])
 
+    // We want to start expiring services as close to their instantiation
+    // as possible. By installing `ExpiringService` here, we are guaranteed
+    // to wrap the server's dispatcher.
+    stk.push(ExpiringService.server)
     stk.push(Role.serverDestTracing, ((next: ServiceFactory[Req, Rep]) =>
       new ServerDestTracingProxy[Req, Rep](next)))
     stk.push(TimeoutFilter.serverModule)
-    // The DeadlineFilter is pushed after the stats filters so stats are
-    // recorded for the request. If a server processing deadline is set in
-    // TimeoutFilter, the deadline will start from the current time, and
-    // therefore not be expired if the request were to then pass through
-    // DeadlineFilter. Thus, DeadlineFilter is pushed before TimeoutFilter.
-    stk.push(DeadlineFilter.module)
+    stk.push(DeadlineStatsFilter.module)
     stk.push(DtabStatsFilter.module)
     // Admission Control filters are inserted after `StatsFilter` so that rejected
     // requests are counted. We may need to adjust how latency are recorded
@@ -148,6 +147,7 @@ trait StdStackServer[Req, Rep, This <: StdStackServer[Req, Rep, This]]
   with Stack.Parameterized[This]
   with CommonParams[This]
   with WithServerTransport[This]
+  with WithServerSession[This]
   with WithServerAdmissionControl[This] { self =>
 
   /**
@@ -257,8 +257,19 @@ trait StdStackServer[Req, Rep, This <: StdStackServer[Req, Rep, This]]
       // Listen over `addr` and serve traffic from incoming transports to
       // `serviceFactory` via `newDispatcher`.
       val listener = server.newListener()
+
+      // Export info about the listener type so that we can query info
+      // about its implementation at runtime. This assumes that the `toString`
+      // of the implementation is sufficiently descriptive.
+      val listenerImplKey = Seq(
+        ServerRegistry.registryName,
+        params[ProtocolLibrary].name,
+        params[Label].label,
+        "Listener")
+      GlobalRegistry.get.put(listenerImplKey, listener.toString)
+
       val underlying = listener.listen(addr) { transport =>
-        serviceFactory(newConn(transport)) respond {
+        serviceFactory(newConn(transport)).respond {
           case Return(service) =>
             val d = server.newDispatcher(transport, service)
             connections.add(d)

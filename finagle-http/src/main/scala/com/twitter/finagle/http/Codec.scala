@@ -6,10 +6,11 @@ import com.twitter.finagle.dispatch.GenSerialClientDispatcher
 import com.twitter.finagle.filter.PayloadSizeFilter
 import com.twitter.finagle.http.codec._
 import com.twitter.finagle.http.filter.{ClientContextFilter, DtabFilter, HttpNackFilter, ServerContextFilter}
-import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
+import com.twitter.finagle.http.netty.{Netty3ClientStreamTransport, Netty3ServerStreamTransport}
+import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver, ServerStatsReceiver}
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.Transport
-import com.twitter.util.{Closable, StorageUnit, Try}
+import com.twitter.util.{NonFatal, Closable, StorageUnit, Try}
 import java.net.InetSocketAddress
 import org.jboss.netty.channel.{Channel, ChannelEvent, ChannelHandlerContext, ChannelPipelineFactory, Channels, UpstreamMessageEvent}
 import org.jboss.netty.handler.codec.http._
@@ -24,6 +25,7 @@ object BadHttpRequest {
 }
 
 private[finagle] sealed trait BadReq
+private[finagle] trait ContentTooLong extends BadReq
 private[finagle] trait UriTooLong extends BadReq
 private[finagle] trait HeaderFieldsTooLarge extends BadReq
 
@@ -46,6 +48,19 @@ private[finagle] object BadRequest {
     )
 
     apply(msg)
+  }
+
+  def contentTooLong(msg: BadHttpRequest): BadRequest with ContentTooLong =
+    new BadRequest(msg, msg.exception) with ContentTooLong
+
+  def contentTooLong(exn: Throwable): BadRequest with ContentTooLong = {
+    val msg = new BadHttpRequest(
+      HttpVersion.HTTP_1_0,
+      HttpMethod.GET,
+      "/bad-http-request",
+      exn
+    )
+    contentTooLong(msg)
   }
 
   def uriTooLong(msg: BadHttpRequest): BadRequest with UriTooLong =
@@ -72,6 +87,24 @@ private[finagle] object BadRequest {
       exn
     )
     headerTooLong(msg)
+  }
+}
+
+
+/**
+ * a HttpChunkAggregator which recovers decode failures into 4xx http responses
+ */
+private[http] class SafeServerHttpChunkAggregator(maxContentSizeBytes: Int) extends HttpChunkAggregator(maxContentSizeBytes) {
+
+  override def handleUpstream(ctx: ChannelHandlerContext, e: ChannelEvent): Unit = {
+    try {
+      super.handleUpstream(ctx, e)
+    } catch {
+      case NonFatal(ex) =>
+        val channel = ctx.getChannel()
+        ctx.sendUpstream(new UpstreamMessageEvent(
+          channel, BadHttpRequest(ex), channel.getRemoteAddress()))
+    }
   }
 }
 
@@ -167,6 +200,7 @@ case class Http(
   def maxRequestSize(bufferSize: StorageUnit) = copy(_maxRequestSize = bufferSize)
   def maxResponseSize(bufferSize: StorageUnit) = copy(_maxResponseSize = bufferSize)
   def decompressionEnabled(yesno: Boolean) = copy(_decompressionEnabled = yesno)
+  @deprecated("Use maxRequestSize to enforce buffer footprint limits", "2016-05-10")
   def channelBufferUsageTracker(usageTracker: ChannelBufferUsageTracker) =
     copy(_channelBufferUsageTracker = Some(usageTracker))
   def annotateCipherHeader(headerName: String) = copy(_annotateCipherHeader = Option(headerName))
@@ -213,27 +247,31 @@ case class Http(
         // Waiting on CSL-915 for a proper fix.
         underlying.map { u =>
           val filters =
-            new ClientContextFilter[Request, Response].andThenIf(!_streaming ->
-              new PayloadSizeFilter[Request, Response](
-                params[param.Stats].statsReceiver, _.content.length, _.content.length
+            new ClientContextFilter[Request, Response]
+              .andThen(new DtabFilter.Injector)
+              .andThenIf(!_streaming ->
+                new PayloadSizeFilter[Request, Response](
+                  params[param.Stats].statsReceiver, _.content.length, _.content.length
+                )
               )
-            )
 
           filters.andThen(new DelayedReleaseService(u))
         }
 
       override def newClientTransport(ch: Channel, statsReceiver: StatsReceiver): Transport[Any,Any] =
-        new HttpTransport(super.newClientTransport(ch, statsReceiver))
+        super.newClientTransport(ch, statsReceiver)
 
       override def newClientDispatcher(transport: Transport[Any, Any], params: Stack.Params) =
         new HttpClientDispatcher(
-          transport,
+          new HttpTransport(new Netty3ClientStreamTransport(transport)),
           params[param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
         )
 
       override def newTraceInitializer =
         if (_enableTracing) new HttpClientTraceInitializer[Request, Response]
         else TraceInitializerFilter.empty[Request, Response]
+
+      override def protocolLibraryName: String = Http.this.protocolLibraryName
     }
   }
 
@@ -270,7 +308,7 @@ case class Http(
           if (!_streaming)
             pipeline.addLast(
               "httpDechunker",
-              new HttpChunkAggregator(maxRequestSizeInBytes))
+              new SafeServerHttpChunkAggregator(maxRequestSizeInBytes))
 
           _annotateCipherHeader foreach { headerName: String =>
             pipeline.addLast("annotateCipher", new AnnotateCipher(headerName))
@@ -283,8 +321,10 @@ case class Http(
       override def newServerDispatcher(
         transport: Transport[Any, Any],
         service: Service[Request, Response]
-      ): Closable =
-        new HttpServerDispatcher(new HttpTransport(transport), service)
+      ): Closable = new HttpServerDispatcher(
+        new HttpTransport(new Netty3ServerStreamTransport(transport)),
+        service,
+        ServerStatsReceiver)
 
       override def prepareConnFactory(
         underlying: ServiceFactory[Request, Response],
@@ -292,7 +332,7 @@ case class Http(
       ): ServiceFactory[Request, Response] = {
         val param.Stats(stats) = params[param.Stats]
         new HttpNackFilter(stats)
-          .andThen(new DtabFilter.Finagle[Request])
+          .andThen(new DtabFilter.Extractor)
           .andThen(new ServerContextFilter[Request, Response])
           .andThenIf(!_streaming -> new PayloadSizeFilter[Request, Response](
             stats, _.content.length, _.content.length)

@@ -2,7 +2,6 @@ package com.twitter.finagle.redis
 
 import com.twitter.finagle.netty3.ChannelBufferBuf
 import com.twitter.finagle.{Service, ClientConnection, ServiceFactory, ServiceProxy}
-import com.twitter.finagle.builder.ClientBuilder
 import com.twitter.finagle.redis.exp.{RedisPool, SubscribeCommands}
 import com.twitter.finagle.redis.protocol._
 import com.twitter.finagle.util.DefaultTimer
@@ -16,13 +15,8 @@ object Client {
    * Construct a client from a single host.
    * @param host a String of host:port combination.
    */
-  def apply(host: String): Client = Client(
-    ClientBuilder()
-      .hosts(host)
-      .hostConnectionLimit(1)
-      .codec(Redis())
-      .daemon(true)
-      .buildFactory())
+  def apply(host: String): Client =
+    new Client(com.twitter.finagle.Redis.client.newClient(host))
 
   /**
    * Construct a client from a single Service.
@@ -32,27 +26,27 @@ object Client {
 }
 
 class Client(
-  override val factory: ServiceFactory[Command, Reply],
-  private[redis] val timer: Timer = DefaultTimer.twitter)
+    override val factory: ServiceFactory[Command, Reply],
+    private[redis] val timer: Timer = DefaultTimer.twitter)
   extends BaseClient(factory)
   with NormalCommands
   with SubscribeCommands
   with Transactions
 
 trait NormalCommands
-  extends Keys
-  with Strings
-  with Hashes
-  with SortedSets
-  with Lists
-  with Sets
+  extends KeyCommands
+  with StringCommands
+  with HashCommands
+  with SortedSetCommands
+  with ListCommands
+  with SetCommands
   with BtreeSortedSetCommands
   with TopologyCommands
-  with HyperLogLogs
-  with PubSubs
+  with HyperLogLogCommands
+  with PubSubCommands
   with ServerCommands
-  with ConnectionCommands {
-  self: BaseClient =>
+  with ScriptCommands
+  with ConnectionCommands { self: BaseClient =>
 }
 
 trait Transactions { self: Client =>
@@ -113,7 +107,7 @@ abstract class BaseClient(
   /**
    * Helper function to convert a Redis multi-bulk reply into a map of pairs
    */
-  private[redis] def returnPairs(messages: Seq[ChannelBuffer]) = {
+  private[redis] def returnPairs[A](messages: Seq[A]) = {
     assert(messages.length % 2 == 0, "Odd number of items in response")
     messages.grouped(2).toSeq.flatMap {
       case Seq(a, b) => Some((a, b))
@@ -127,13 +121,8 @@ object TransactionalClient {
    * Construct a client from a single host with transaction commands
    * @param host a String of host:port combination.
    */
-  def apply(host: String): TransactionalClient = TransactionalClient(
-    ClientBuilder()
-      .hosts(host)
-      .hostConnectionLimit(1)
-      .codec(Redis())
-      .daemon(true)
-      .buildFactory())
+  def apply(host: String): TransactionalClient =
+    new TransactionalClient(com.twitter.finagle.Redis.client.newClient(host))
 
   /**
    * Construct a client from a service factory
@@ -195,11 +184,11 @@ class TransactionalClient(factory: ServiceFactory[Command, Reply])
         _watch = false
         _multi = false
         Future.value(messages)
-      case EmptyMBulkReply() =>
+      case EmptyMBulkReply =>
         _watch = false
         _multi = false
         Future.Nil
-      case NilMBulkReply() =>
+      case NilMBulkReply =>
         _watch = false
         _multi = false
         Future.exception(new ServerError("One or more keys were modified before transaction"))

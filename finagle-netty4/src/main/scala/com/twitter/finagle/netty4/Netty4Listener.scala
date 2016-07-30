@@ -4,37 +4,35 @@ import com.twitter.concurrent.NamedPoolThreadFactory
 import com.twitter.finagle._
 import com.twitter.finagle.netty4.channel.{ServerBridge, Netty4ServerChannelInitializer}
 import com.twitter.finagle.netty4.transport.ChannelTransport
+import com.twitter.finagle.param.Timer
 import com.twitter.finagle.server.Listener
-import com.twitter.finagle.ssl.Engine
 import com.twitter.finagle.transport.Transport
 import com.twitter.util._
 import io.netty.bootstrap.ServerBootstrap
 import io.netty.channel._
 import io.netty.channel.nio.NioEventLoopGroup
-import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioServerSocketChannel
-import io.netty.util.concurrent.GenericFutureListener
+import io.netty.util.concurrent.{Future => NettyFuture, FutureListener}
 import java.lang.{Boolean => JBool, Integer => JInt}
 import java.net.SocketAddress
 import java.util.concurrent.TimeUnit
 
-/**
- * Netty4 TLS configuration.
- *
- * @param newEngine Creates a new SSL engine
- */
-private[finagle] case class Netty4ListenerTLSConfig(newEngine: () => Engine)
-
 private[finagle] object Netty4Listener {
   val TrafficClass: ChannelOption[JInt] = ChannelOption.newInstance("trafficClass")
-}
 
-private[finagle] case class PipelineInit(cf: ChannelPipeline => Unit) {
-  def mk(): (PipelineInit, Stack.Param[PipelineInit]) =
-    (this, PipelineInit.param)
-}
-private[finagle] object PipelineInit {
-  implicit val param = Stack.Param(PipelineInit(_ => ()))
+  /**
+   * A [[com.twitter.finagle.Stack.Param]] used to configure the ability to
+   * exert back pressure by only reading from the Channel when the [[Transport]] is
+   * read.
+   */
+  private[finagle] case class BackPressure(enabled: Boolean) {
+    def mk(): (BackPressure, Stack.Param[BackPressure]) = (this, BackPressure.param)
+  }
+
+  private[finagle] object BackPressure {
+    implicit val param: Stack.Param[BackPressure] =
+      Stack.Param(BackPressure(enabled = true))
+  }
 }
 
 /**
@@ -47,11 +45,14 @@ private[finagle] object PipelineInit {
  * @see [[com.twitter.finagle.param]]
  */
 private[finagle] case class Netty4Listener[In, Out](
+    pipelineInit: ChannelPipeline => Unit,
     params: Stack.Params,
-    transportFactory: SocketChannel => Transport[In, Out] = new ChannelTransport[In, Out](_)
+    transportFactory: Channel => Transport[In, Out] = new ChannelTransport[In, Out](_),
+    handlerDecorator: ChannelInitializer[Channel] => ChannelHandler = identity
   ) extends Listener[In, Out] {
+  import Netty4Listener.BackPressure
 
-  private[this] val PipelineInit(pipelineInit) = params[PipelineInit]
+  private[this] val Timer(timer) = params[Timer]
 
   // transport params
   private[this] val Transport.Liveness(_, _, keepAlive) = params[Transport.Liveness]
@@ -60,12 +61,14 @@ private[finagle] case class Netty4Listener[In, Out](
 
   // listener params
   private[this] val Listener.Backlog(backlog) = params[Listener.Backlog]
+  private[this] val BackPressure(backPressureEnabled) = params[BackPressure]
 
   // netty4 params
   private[this] val param.Allocator(allocator) = params[param.Allocator]
 
   /**
    * Listen for connections and apply the `serveTransport` callback on connected [[Transport transports]].
+   *
    * @param addr socket address for listening.
    * @param serveTransport a call-back for newly created transports which in turn are
    *                       created for new connections.
@@ -100,13 +103,14 @@ private[finagle] case class Netty4Listener[In, Out](
       sendBufSize.foreach(bootstrap.childOption[JInt](ChannelOption.SO_SNDBUF, _))
       recvBufSize.foreach(bootstrap.childOption[JInt](ChannelOption.SO_RCVBUF, _))
       keepAlive.foreach(bootstrap.childOption[JBool](ChannelOption.SO_KEEPALIVE, _))
+      bootstrap.childOption[JBool](ChannelOption.AUTO_READ, !backPressureEnabled)
       params[Listener.TrafficClass].value.foreach { tc =>
         bootstrap.option[JInt](Netty4Listener.TrafficClass, tc)
         bootstrap.childOption[JInt](Netty4Listener.TrafficClass, tc)
       }
 
       val initializer = new Netty4ServerChannelInitializer(pipelineInit, params, newBridge)
-      bootstrap.childHandler(initializer)
+      bootstrap.childHandler(handlerDecorator(initializer))
 
       // Block until listening socket is bound. `ListeningServer`
       // represents a bound server and if we don't block here there's
@@ -126,16 +130,25 @@ private[finagle] case class Netty4Listener[In, Out](
 
         val p = new Promise[Unit]
 
+        val timeout = deadline - Time.now
+        val timeoutMs = timeout.inMillis
+
         // The boss loop immediately starts refusing new work.
-        // Existing tasks have ``deadline`` time to finish executing.
+        // Existing tasks have ``timeoutMs`` time to finish executing.
         bossLoop
-          .shutdownGracefully(0 /* quietPeriod */ , deadline.inMillis /* timeout */ , TimeUnit.MILLISECONDS)
-          .addListener(new GenericFutureListener[Nothing] {
-            def operationComplete(future: Nothing): Unit = p.setDone()
+          .shutdownGracefully(0 /* quietPeriod */ , timeoutMs.max(0), TimeUnit.MILLISECONDS)
+          .addListener(new FutureListener[Any] {
+            def operationComplete(future: NettyFuture[Any]) = p.setDone()
           })
-        p
+
+        // Don't rely on netty to satisfy the promise and transform all results to
+        // success because we don't want the non-deterministic lifecycle of external
+        // resources to affect application success.
+        p.raiseWithin(timeout)(timer).transform { _ => Future.Done }
       }
 
       def boundAddress: SocketAddress = ch.localAddress()
     }
+
+  override def toString: String = "Netty4Listener"
 }

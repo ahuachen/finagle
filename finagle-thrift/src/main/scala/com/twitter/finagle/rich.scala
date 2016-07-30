@@ -4,7 +4,6 @@ import com.twitter.finagle.param.Stats
 import com.twitter.finagle.service.ResponseClassifier
 import com.twitter.finagle.stats._
 import com.twitter.finagle.thrift._
-import com.twitter.finagle.thrift.service.ThriftResponseClassifier
 import com.twitter.finagle.util.Showable
 import com.twitter.util.NonFatal
 import java.lang.reflect.{Constructor, Method}
@@ -244,7 +243,7 @@ private[twitter] object ThriftUtil {
    * (Legacy version for backward-compatibility).
    */
   def serverFromIface(impl: AnyRef, protocolFactory: TProtocolFactory, serviceName: String): BinaryService = {
-    serverFromIface(impl, protocolFactory, LoadedStatsReceiver, Thrift.maxThriftBufferSize, serviceName)
+    serverFromIface(impl, protocolFactory, LoadedStatsReceiver, Thrift.Server.maxThriftBufferSize, serviceName)
   }
 }
 
@@ -409,7 +408,7 @@ trait ThriftRichClient { self: Client[ThriftClientRequest, Array[Byte]] =>
    * you can construct a client interface with a Finagle Service per thrift method:
    *
    * {{{
-   *   val loggerService = Thrift.newServiceIface[Logger.ServiceIface]("localhost:8000")
+   *   val loggerService = Thrift.client.newServiceIface[Logger.ServiceIface]("localhost:8000")
    *   val response = loggerService.log(Logger.Log.Args("log message", 1))
    * }}}
    *
@@ -493,7 +492,7 @@ trait ThriftRichServer { self: Server[Array[Byte], Array[Byte]] =>
 
   protected val protocolFactory: TProtocolFactory
 
-  val maxThriftBufferSize: Int = 16 * 1024
+  protected val maxThriftBufferSize = Thrift.Server.maxThriftBufferSize
 
   protected val serverLabel = "thrift"
 

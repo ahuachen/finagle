@@ -3,9 +3,9 @@ package com.twitter.finagle.mux
 import com.twitter.concurrent.AsyncQueue
 import com.twitter.conversions.time._
 import com.twitter.finagle._
+import com.twitter.finagle.util.{BufReader, BufWriter}
 import com.twitter.finagle.mux.lease.exp.{Lessee, Lessor}
 import com.twitter.finagle.mux.transport.Message
-import com.twitter.finagle.netty3.{ChannelBufferBuf, BufChannelBuffer}
 import com.twitter.finagle.stats.{InMemoryStatsReceiver, NullStatsReceiver}
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.QueueTransport
@@ -14,7 +14,6 @@ import com.twitter.util.{Await, Future, Promise, Duration, Closable, Time}
 import java.io.{PrintWriter, StringWriter}
 import java.net.{Socket, InetSocketAddress}
 import java.util.concurrent.atomic.AtomicInteger
-import org.jboss.netty.buffer.ChannelBuffers
 import org.junit.runner.RunWith
 import org.scalatest.concurrent.{IntegrationPatience, Eventually}
 import org.scalatest.junit.{AssertionsForJUnit, JUnitRunner}
@@ -94,18 +93,18 @@ class EndToEndTest extends FunSuite
 
   test("(no) Dtab propagation") {
     val server = Mux.serve("localhost:*", Service.mk[Request, Response] { _ =>
-      val buf = ChannelBuffers.buffer(4)
-      buf.writeInt(Dtab.local.size)
-      Future.value(Response(ChannelBufferBuf.Owned(buf)))
+      val bw = BufWriter.fixed(4)
+      bw.writeIntBE(Dtab.local.size)
+      Future.value(Response(bw.owned()))
     })
 
     val client = Mux.newService(server)
 
     val payload = Await.result(client(Request.empty), 30.seconds).body
-    val cb = BufChannelBuffer(payload)
+    val br = BufReader(payload)
 
-    assert(cb.readableBytes() === 4)
-    assert(cb.readInt() === 0)
+    assert(br.remaining == 4)
+    assert(br.readIntBE() == 0)
     Await.result(server.close())
     Await.result(client.close())
   }
@@ -360,5 +359,32 @@ EOF
     assert(sr.stat("server", "response_payload_bytes")() == Seq(20.0f))
 
     Await.ready(Closable.all(server, client).close())
+  }
+
+  test("various netty implementations") {
+    val muxEchoService = Service.mk[Request, Response] { req =>
+      Future.value(Response(req.body))
+    }
+
+    val baseServer: Mux.Server = Mux.server
+    val servers: Seq[Mux.Server] = Seq(
+      baseServer.configured(Mux.param.MuxImpl.Netty3),
+      baseServer.configured(Mux.param.MuxImpl.Netty4))
+
+    val baseClient: Mux.Client = Mux.client
+    val clients: Seq[Mux.Client] = Seq(
+      baseClient.configured(Mux.param.MuxImpl.Netty3),
+      baseClient.configured(Mux.param.MuxImpl.Netty4))
+
+    for (server <- servers; client <- clients) {
+      val srv = server.serve("localhost:*", muxEchoService)
+      val clnt = client.newService(srv)
+
+      val req = clnt(Request(Path.empty, Buf.Utf8("hello world")))
+      assert(Await.result(req, 5.seconds) == Response(Buf.Utf8("hello world")))
+
+      Await.result(srv.close(), 5.seconds)
+      Await.result(clnt.close(), 5.seconds)
+    }
   }
 }

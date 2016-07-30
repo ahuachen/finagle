@@ -1,5 +1,6 @@
 package com.twitter.finagle.filter
 
+import com.twitter.conversions.time._
 import com.twitter.finagle._
 import com.twitter.finagle.builder.{ClientBuilder, ServerBuilder}
 import com.twitter.finagle.integration.{StringCodec, IntegrationBase}
@@ -52,6 +53,32 @@ class MonitorFilterTest extends FunSuite with MockitoSugar with IntegrationBase 
     val f = service(123)
     assert(f.poll == Some(Throw(exc)))
     verify(monitor).handle(exc)
+  }
+
+  test("MonitorFilter should not fail on exceptions thrown in callbacks") {
+    var handled = false
+    val monitor = Monitor.mk {
+      case _ =>
+        handled = true
+        true
+    }
+    val p1 = Promise[Unit]
+    val p2 = Promise[Int]
+    val svc = Service.mk[Int, Int] { num: Int =>
+      p1.onSuccess { _ =>
+        throw new Exception("boom!")
+      }
+      p1.before(p2)
+    }
+    val filter = new MonitorFilter[Int, Int](monitor)
+    val filteredSvc = filter.andThen(svc)
+
+    val f = filteredSvc(0)
+    p1.setDone()
+    assert(handled)
+    assert(!f.isDefined)
+    p2.setValue(1)
+    assert(Await.result(f, 2.seconds) == 1)
   }
 
   class MockSourcedException(underlying: Throwable, name: String)
@@ -109,6 +136,10 @@ class MonitorFilterTest extends FunSuite with MockitoSugar with IntegrationBase 
       Matchers.eq(Level.SEVERE),
       Matchers.eq("The 'FakeService2' service FakeService2 on behalf of FakeService1 threw an exception"),
       Matchers.eq(outer))
+
+    // need to properly close the client and the server, otherwise they will prevent ExitGuard from exiting and interfere with ExitGuardTest
+    Await.ready(client.close(), 1.second)
+    Await.ready(server.close(), 1.second)
   }
 
   test("MonitorFilter should when attached to a client, report source for sourced exceptions") {
@@ -145,6 +176,5 @@ class MonitorFilterTest extends FunSuite with MockitoSugar with IntegrationBase 
     verify(monitor, times(0)).handle(inner)
     verify(monitor).handle(outer)
   }
-
 
 }
